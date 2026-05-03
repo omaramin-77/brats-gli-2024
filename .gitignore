@@ -1,0 +1,42 @@
+# Patient imaging data — never commit raw NIfTI volumes
+*.nii.gz
+*.nii
+
+# Raw data folder contents (DATA_PATH.txt is whitelisted below)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/DATA_PATH.txt
+
+# Preprocessed cache (regenerable from raw + shared/preprocessing.py)
+data/processed/
+
+# MLflow tracking artefacts (each member runs their own server locally)
+experiments/mlruns/
+
+# Model checkpoints — too large for git, members keep them on disk only
+results/checkpoints/
+*.pt
+*.pth
+
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS / Jupyter cruft
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# Local secrets and logs
+.env
+*.env
+*.log
