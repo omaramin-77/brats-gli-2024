@@ -1,0 +1,13 @@
+{
+  "total_available": 1350,
+  "subset_size": 350,
+  "train": 280,
+  "val": 35,
+  "test": 35,
+  "seed": 42,
+  "tumor_fraction_mean_train": 0.010194095921073726,
+  "tumor_fraction_mean_val": 0.009772971904451172,
+  "tumor_fraction_mean_test": 0.010117204458151847,
+  "created_by": "create_splits.py",
+  "note": "Do not re-run this script. All members load from these files."
+}
