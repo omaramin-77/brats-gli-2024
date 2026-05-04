@@ -80,9 +80,11 @@ class BraTSDataset(Dataset):
         augment: bool = False,
         patches_per_volume: int = 4,
     ):
-        if modality not in _VALID_MODALITIES:
+        VALID_MODALITIES = {"t1n", "t1c", "t2w", "t2f", "multimodal"}
+        if modality not in VALID_MODALITIES:
             raise ValueError(
-                f"modality must be one of {_VALID_MODALITIES}; got {modality!r}"
+                f"Unknown modality '{modality}'. "
+                f"Must be one of {sorted(VALID_MODALITIES)}."
             )
 
         self.data_root = data_root

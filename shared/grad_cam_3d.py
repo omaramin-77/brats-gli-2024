@@ -5,6 +5,13 @@ Members attach this to the last convolutional block of their encoder/decoder
 implementation mirrors the original Grad-CAM paper, generalised from 2D to 3D
 by averaging gradients over the (D, H, W) spatial axes.
 
+Preferred usage (hooks always released, even on exception)::
+
+    with GradCAM3D(model, target_layer) as cam:
+        heatmap = cam.generate(input_tensor)
+
+The context manager calls ``remove_hooks()`` on exit automatically.
+
 Example
 -------
 ::
@@ -122,3 +129,10 @@ class GradCAM3D:
             warnings.warn("backward hook was already removed")
         self._activations = None
         self._gradients = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.remove_hooks()
+        return False   # do not suppress exceptions

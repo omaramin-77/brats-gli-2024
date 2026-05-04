@@ -103,6 +103,10 @@ def main() -> None:
         print(f"[epoch {epoch:03d}] train_loss={train_metrics['loss']:.4f}")
         # mlflow.log_metric("train_loss", train_metrics["loss"], step=epoch)
 
+        # Members 2-5: copy this condition exactly — do not use epoch % N alone.
+        # The `or epoch == NUM_EPOCHS` clause guarantees a final validation when
+        # NUM_EPOCHS is not a multiple of VAL_EVERY_N_EPOCHS, otherwise the
+        # last training step's state never reaches EarlyStopper / CheckpointManager.
         if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == NUM_EPOCHS:
             val_metrics = validate_one_epoch(model, val_loader, device, dice_bce_loss)
             print(

@@ -7,6 +7,9 @@ data/raw/*
 !data/raw/.gitkeep
 !data/raw/DATA_PATH.txt
 
+# local data path override — never commit
+data/raw/DATA_PATH.local.txt
+
 # Preprocessed cache (regenerable from raw + shared/preprocessing.py)
 data/processed/
 

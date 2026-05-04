@@ -20,6 +20,7 @@ GLOBAL_SEED = 42
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPLITS_DIR = REPO_ROOT / "data" / "splits"
 DATA_PATH_FILE = REPO_ROOT / "data" / "raw" / "DATA_PATH.txt"
+DATA_PATH_LOCAL_FILE = REPO_ROOT / "data" / "raw" / "DATA_PATH.local.txt"
 RESULTS_DIR = REPO_ROOT / "results"
 CHECKPOINT_DIR = RESULTS_DIR / "checkpoints"
 FIGURES_DIR = RESULTS_DIR / "figures"
@@ -27,26 +28,38 @@ TABLES_DIR = RESULTS_DIR / "tables"
 MLRUNS_DIR = REPO_ROOT / "experiments" / "mlruns"
 
 
-def get_data_root() -> str:
-    """Read the absolute path to the raw BraTS folder from DATA_PATH.txt.
+def _read_first_nonempty_line(path: Path) -> str:
+    """Return the first non-empty stripped line of ``path``, or '' if none."""
+    if not path.exists():
+        return ""
+    raw = path.read_text(encoding="utf-8").strip().splitlines()
+    return next((line.strip() for line in raw if line.strip()), "")
 
-    Each team machine writes its own DATA_PATH.txt the first time it clones.
-    The file is committed but contains a local absolute path; members update
-    it on their own machine and never push the change.
+
+def get_data_root() -> str:
+    """Read the absolute path to the raw BraTS folder.
+
+    Resolution order:
+        1. ``data/raw/DATA_PATH.local.txt`` (gitignored, per-machine override).
+        2. ``data/raw/DATA_PATH.txt`` (committed fallback).
+
+    Members create ``DATA_PATH.local.txt`` on their own machine and never push
+    it; ``DATA_PATH.txt`` stays unchanged for the primary workstation.
     """
-    if not DATA_PATH_FILE.exists():
-        raise FileNotFoundError(
-            f"DATA_PATH.txt missing at {DATA_PATH_FILE}. "
-            "Write the absolute path to the BraTS root into this file."
-        )
-    raw = DATA_PATH_FILE.read_text(encoding="utf-8").strip().splitlines()
-    candidate = next((line.strip() for line in raw if line.strip()), "")
+    candidate = _read_first_nonempty_line(DATA_PATH_LOCAL_FILE)
     if not candidate:
-        raise ValueError(f"DATA_PATH.txt at {DATA_PATH_FILE} is empty.")
+        candidate = _read_first_nonempty_line(DATA_PATH_FILE)
+
+    if not candidate:
+        raise FileNotFoundError(
+            "Create data/raw/DATA_PATH.local.txt and put the absolute path to "
+            "your local BraTS root on a single line. Do not commit this file."
+        )
+
     if not os.path.isdir(candidate):
         raise FileNotFoundError(
             f"DATA_ROOT does not exist on this machine: {candidate}. "
-            "Edit data/raw/DATA_PATH.txt with the path that is valid here."
+            "Edit data/raw/DATA_PATH.local.txt with the path that is valid here."
         )
     return candidate
 

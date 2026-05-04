@@ -1,3 +1,17 @@
+# TL;DR — first 30 minutes
+
+1. `pip install -r requirements.txt` and install PyTorch+CUDA from pytorch.org.
+2. Edit [data/raw/DATA_PATH.txt](data/raw/DATA_PATH.txt) to your local BraTS path. Don't commit.
+3. `python shared/sanity_check.py` → must print `ALL TESTS PASSED`.
+4. **Do not** run `shared/create_splits.py`. Splits are already committed.
+5. Open your member folder. Implement `model.py`. Copy [member1_T1n/train.py](member1_T1n/train.py) into your `train.py`, swap `MODALITY`. Train.
+6. Then implement `evaluate.py` and `xai_analysis.py`.
+7. Branch as `member{N}/{topic}`. PR. Get a review. Merge.
+
+When in doubt, re-read this file or ask in the team channel.
+
+---
+
 # ONBOARDING — Read this first
 
 You just opened the repo. This document is the single document you need so
@@ -143,14 +157,10 @@ pip install -r requirements.txt
 
 ### Step 2 — Tell the repo where the data lives on **your** machine
 
-Open [data/raw/DATA_PATH.txt](data/raw/DATA_PATH.txt) and replace the
-single line with the absolute path to your local copy of the BraTS GLI-2024
-training root. Each patient folder underneath that root must contain four
-NIfTI modalities + a `*seg*.nii.gz` segmentation.
-
-**Do not commit your local edit** — the value already in there is correct
-for the project's primary workstation, and pushing yours will break
-everyone else.
+Create `data/raw/DATA_PATH.local.txt` (already gitignored) and put your
+absolute path to the BraTS root on a single line. Do not edit
+`DATA_PATH.txt` and do not commit `DATA_PATH.local.txt`. The committed
+`DATA_PATH.txt` is the fallback for the primary workstation only.
 
 ### Step 3 — Verify the install with the sanity check
 
@@ -436,16 +446,21 @@ from shared.grad_cam_3d import GradCAM3D
 | 5    | Phase 4 — ensemble + UI         | M5 + lead      | late-fusion ensemble + Streamlit demo                  |
 | 6    | Report + slides                 | All            | written report, final figures and tables               |
 
----
+### Phase 1 acceptance criteria
 
-## TL;DR — first 30 minutes
+Phase 1 (your unimodal pipeline) is complete when ALL of the following are true:
 
-1. `pip install -r requirements.txt` and install PyTorch+CUDA from pytorch.org.
-2. Edit [data/raw/DATA_PATH.txt](data/raw/DATA_PATH.txt) to your local BraTS path. Don't commit.
-3. `python shared/sanity_check.py` → must print `ALL TESTS PASSED`.
-4. **Do not** run `shared/create_splits.py`. Splits are already committed.
-5. Open your member folder. Implement `model.py`. Copy [member1_T1n/train.py](member1_T1n/train.py) into your `train.py`, swap `MODALITY`. Train.
-6. Then implement `evaluate.py` and `xai_analysis.py`.
-7. Branch as `member{N}/{topic}`. PR. Get a review. Merge.
+- `val_dice_wt > 0.60` on the validation set.
+  T1n may land closer to 0.55 — acceptable if the training curve has converged.
+- Your training curve (loss and val Dice vs epoch) is saved to
+  `results/figures/` and shows convergence, not divergence or flat-line.
+- Your MLflow run contains `train_loss`, `val_dice_wt`, `val_iou`, and
+  `val_hd95` logged per epoch.
+- No hardcoded absolute paths exist anywhere in your member folder.
+- `python shared/sanity_check.py` still passes after your changes.
 
-When in doubt, re-read this file or ask in the team channel.
+If `val_dice_wt < 0.45` after 30 epochs, **do not keep training — diagnose
+first**. Common causes: loss not decreasing (check label IDs, check loss
+reduction), all-zero predictions (Dice loss started at 1.0 and never moved —
+check sigmoid), OOM being silently caught (check GPU utilisation).
+
