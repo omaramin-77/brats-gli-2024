@@ -125,6 +125,35 @@ def main() -> None:
         fail(f"dice_bce_loss returned non-finite value: {loss.item()}")
     print(f"[sanity] loss        : {loss.item():.4f}  OK")
 
+    # --- Step 11b: GradCAM3D context-manager smoke test --------------------
+    import torch.nn as nn
+    from shared.grad_cam_3d import GradCAM3D
+
+    class _SanityTinyNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = nn.Conv3d(1, 4, 3, padding=1)
+            self.head = nn.Conv3d(4, 1, 1)
+
+        def forward(self, x):
+            return torch.sigmoid(self.head(self.encoder(x)))
+
+    cam_net = _SanityTinyNet()
+    cam_net.eval()
+    target_layer = cam_net.encoder
+    hooks_before = len(target_layer._forward_hooks) + len(target_layer._backward_hooks)
+    cam_input = torch.randn(1, 1, 16, 16, 16)
+    with GradCAM3D(cam_net, target_layer) as cam:
+        heatmap = cam.generate(cam_input)
+    hooks_after = len(target_layer._forward_hooks) + len(target_layer._backward_hooks)
+    if heatmap.shape != (16, 16, 16):
+        fail(f"GradCAM3D heatmap shape {heatmap.shape} != (16,16,16)")
+    if heatmap.min() < 0.0 or heatmap.max() > 1.0 + 1e-5:
+        fail(f"GradCAM3D heatmap range [{heatmap.min():.3f},{heatmap.max():.3f}] outside [0,1]")
+    if hooks_after != hooks_before:
+        fail("GradCAM3D context manager leaked hooks on exit")
+    print(f"[sanity] gradcam3d   : shape={heatmap.shape} range=[{heatmap.min():.3f},{heatmap.max():.3f}]  OK")
+
     # --- Step 12: figure --------------------------------------------------
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     fig_path = FIGURES_DIR / "sanity_check_patient.png"

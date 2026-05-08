@@ -43,3 +43,6 @@ Thumbs.db
 .env
 *.env
 *.log
+
+# Claude Code working files — never commit
+.claude/
