@@ -62,16 +62,15 @@ class T2fSegModel(nn.Module):
 
         # Decoder
         self.up4  = nn.ConvTranspose3d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.dec4 = ResBlock3D(base_ch * 8, base_ch * 4)
-
+        self.dec4 = ResBlock3D(base_ch * 4 + base_ch * 8, base_ch * 4)   # 128+256=384 → 128
         self.up3  = nn.ConvTranspose3d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.dec3 = ResBlock3D(base_ch * 4, base_ch * 2)
+        self.dec3 = ResBlock3D(base_ch * 2 + base_ch * 4, base_ch * 2)   # 64+128=192  → 64
 
         self.up2  = nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.dec2 = ResBlock3D(base_ch * 2, base_ch)
+        self.dec2 = ResBlock3D(base_ch + base_ch * 2, base_ch)            # 32+64=96    → 32
 
         self.up1  = nn.ConvTranspose3d(base_ch, base_ch, kernel_size=2, stride=2)
-        self.dec1 = ResBlock3D(base_ch * 2, base_ch)
+        self.dec1 = ResBlock3D(base_ch + base_ch, base_ch)                # 32+32=64    → 32
 
         # Output
         self.out_conv = nn.Conv3d(base_ch, 1, kernel_size=1)
