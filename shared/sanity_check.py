@@ -55,7 +55,7 @@ def main() -> None:
     print(f"[sanity] splits      : train={stats['train']} val={stats['val']} test={stats['test']}  OK")
 
     # --- Step 4-8: preprocess one patient ---------------------------------
-    patient_id = splits["train"][0]
+    patient_id = splits["train"][100]
     patient_dir = Path(data_root) / patient_id
     print(f"[sanity] testing on  : {patient_id}")
 

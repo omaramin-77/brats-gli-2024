@@ -1,0 +1,2 @@
+member,modality,architecture,dice,iou,hd95,val_dice_best,checkpoint_epoch
+M3,t2w,SwinUNETR,0.7913,0.6888,8.12,0.8549,45
