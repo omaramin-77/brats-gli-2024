@@ -14,7 +14,6 @@ Run directly to sanity-check both:
 """
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 
 
@@ -53,8 +52,9 @@ class T2fSegModel(nn.Module):
     Input:  (B, 1, D, H, W)
     Output: (B, 1, D, H, W)  — raw logits
     """
+    """TODO: implement encoder-decoder for T2f/FLAIR."""
 
-    def __init__(self, in_channels: int = 1, base_ch: int = 32):
+    def __init__(self, in_channels: int = 1, out_channels: int = 3):
         super().__init__()
         self.arch_name = "ResUNet3D"
 
@@ -70,16 +70,15 @@ class T2fSegModel(nn.Module):
 
         # Decoder
         self.up4  = nn.ConvTranspose3d(base_ch * 8, base_ch * 4, kernel_size=2, stride=2)
-        self.dec4 = ResBlock3D(base_ch * 4 + base_ch * 8, base_ch * 4)   # 128+256 → 128
-
+        self.dec4 = ResBlock3D(base_ch * 4 + base_ch * 4 + base_ch * 8, base_ch * 4)   # 128+256 → 128   # 128+256=384 → 128
         self.up3  = nn.ConvTranspose3d(base_ch * 4, base_ch * 2, kernel_size=2, stride=2)
-        self.dec3 = ResBlock3D(base_ch * 2 + base_ch * 4, base_ch * 2)   # 64+128  → 64
+        self.dec3 = ResBlock3D(base_ch * 2 + base_ch * 2 + base_ch * 4, base_ch * 2)   # 64+128  → 64   # 64+128=192  → 64
 
         self.up2  = nn.ConvTranspose3d(base_ch * 2, base_ch, kernel_size=2, stride=2)
-        self.dec2 = ResBlock3D(base_ch + base_ch * 2, base_ch)            # 32+64   → 32
+        self.dec2 = ResBlock3D(base_ch + base_ch + base_ch * 2, base_ch)            # 32+64   → 32            # 32+64=96    → 32
 
         self.up1  = nn.ConvTranspose3d(base_ch, base_ch, kernel_size=2, stride=2)
-        self.dec1 = ResBlock3D(base_ch + base_ch, base_ch)                # 32+32   → 32
+        self.dec1 = ResBlock3D(base_ch + base_ch, base_ch)                # 32+32=64    → 32
 
         self.out_conv = nn.Conv3d(base_ch, 1, kernel_size=1)
 
