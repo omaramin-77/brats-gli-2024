@@ -99,6 +99,25 @@ def write_split_file(path: Path, ids: Iterable[str]) -> None:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check-only", action="store_true",
+        help="Re-run overlap/ET checks against committed splits without resampling.",
+    )
+    args = parser.parse_args()
+
+    if args.check_only:
+        train = (SPLITS_DIR / "train_ids.txt").read_text().split()
+        val = (SPLITS_DIR / "val_ids.txt").read_text().split()
+        test = (SPLITS_DIR / "test_ids.txt").read_text().split()
+        assert not (set(train) & set(val)), "train/val overlap"
+        assert not (set(train) & set(test)), "train/test overlap"
+        assert not (set(val) & set(test)), "val/test overlap"
+        print(f"Splits checked: train={len(train)} val={len(val)} test={len(test)}, no overlap")
+        print("ET-presence check skipped (would require scanning every seg).")
+        return
+
     rng = np.random.default_rng(GLOBAL_SEED)
 
     data_root = get_data_root()

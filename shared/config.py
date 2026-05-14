@@ -78,7 +78,7 @@ else:
 # 14 GB cutoff: the 4080 (16 GB) gets 96**3 patches; 12 GB cards (3060/5070)
 # fall back to 64**3 to leave headroom for AMP buffers and validation.
 PATCH_SIZE = (96, 96, 96) if VRAM_GB >= 14 else (64, 64, 64)
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 # Windows lacks a usable fork(), so DataLoader workers re-import the parent
 # script and frequently deadlock. Keep 0 on Windows; bump to 4 on Linux/WSL2.
 NUM_WORKERS = 0
@@ -88,25 +88,38 @@ NUM_WORKERS = 0
 # ---------------------------------------------------------------------------
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
-NUM_EPOCHS = 50
+NUM_EPOCHS = 50  # 50 chosen over 100 to fit team hardware budget;
+                # rely on EarlyStopper(patience=15) to halt earlier
+                # if val_dice_wt plateaus.
 PATIENCE = 15
 VAL_EVERY_N_EPOCHS = 5
 GRAD_CLIP_NORM = 1.0
 AMP_ENABLED = True
 
 # ---------------------------------------------------------------------------
-# BraTS GLI-2024 segmentation labels
+# BraTS GLI-2024 labels (used inside dataset.py to build WT/TC/ET):
+#   0 = background
+#   1 = necrotic core (NCR)
+#   2 = peritumoural oedema (ED)
+#   3 = enhancing tumour (ET)
+#   4 = resection cavity (RC, excluded from all sub-regions)
 # ---------------------------------------------------------------------------
-LABEL_BACKGROUND = 0
-LABEL_TC = 2          # Tumour core / necrosis
-LABEL_ET = 4          # Enhancing tumour
-LABEL_WT_VALUES = [2, 4]  # Whole tumour = TC + ET (label 1 is unused in GLI-2024)
 
 # ---------------------------------------------------------------------------
 # Modality ordering — fixed across the whole project so member5's stacked
 # multimodal tensors line up with member1-4's per-channel checkpoints.
 # ---------------------------------------------------------------------------
 MODALITIES = ("t1c", "t1n", "t2f", "t2w")
+
+# ---- 3-channel target convention (BraTS protocol) ----
+# All models output 3 channels in this exact order.
+TARGET_CHANNELS = 3
+TARGET_CHANNEL_NAMES = ("wt", "tc", "et")
+
+# ---- Best-metric for early stopping / checkpointing ----
+# WT is the most stable signal early in training; using ET would
+# stop training prematurely while ET is still warming up.
+BEST_METRIC = "dice_wt"
 
 print(
     f"[config] {DEVICE_NAME} | {VRAM_GB:.1f} GB | "

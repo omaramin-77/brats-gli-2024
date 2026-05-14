@@ -6,6 +6,7 @@ reproducible across machines.
 """
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
@@ -18,6 +19,7 @@ def set_global_seed(seed: int = 42) -> None:
     Note: cuDNN benchmark must be False — when True, cuDNN picks the fastest
     convolution algorithm at runtime, which is non-deterministic across runs.
     """
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

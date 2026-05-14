@@ -74,33 +74,40 @@ def compute_hd95(pred: np.ndarray, target: np.ndarray) -> float:
 def compute_all_metrics(
     pred_logits: torch.Tensor,
     target: torch.Tensor,
+    channel_names: tuple = ("wt", "tc", "et"),
     threshold: float = 0.5,
 ) -> dict:
-    """Sigmoid + threshold pred_logits, then compute Dice/IoU/HD95.
+    """Sigmoid + threshold pred_logits, then compute per-channel
+    Dice / IoU / HD95.
 
-    Accepts both (B,1,H,W,D) and (1,H,W,D) tensors. Returns plain Python
-    floats so the metrics are safe to log to MLflow without GPU references.
+    Accepts (B, C, H, W, D) or (C, H, W, D). Returns a dict with
+    keys dice_{name}, iou_{name}, hd95_{name} for each channel name.
     """
     if pred_logits.ndim == 4:
         pred_logits = pred_logits.unsqueeze(0)
-        target = target.unsqueeze(0) if target.ndim == 3 else target
+    if target.ndim == 4:
+        target = target.unsqueeze(0)
 
     probs = torch.sigmoid(pred_logits)
     pred_bin = (probs >= threshold).to(torch.bool)
     target_bin = (target > 0).to(torch.bool)
 
-    dice = compute_dice(pred_bin, target_bin)
-    iou = compute_iou(pred_bin, target_bin)
+    out: dict = {}
+    for c, name in enumerate(channel_names):
+        p_c = pred_bin[:, c:c+1]
+        t_c = target_bin[:, c:c+1]
 
-    # HD95 is computed per-sample on numpy arrays.
-    hd_vals = []
-    for b in range(pred_bin.shape[0]):
-        p_np = pred_bin[b, 0].detach().cpu().numpy() if pred_bin.ndim == 5 else pred_bin[b].detach().cpu().numpy()
-        t_np = target_bin[b, 0].detach().cpu().numpy() if target_bin.ndim == 5 else target_bin[b].detach().cpu().numpy()
-        hd_vals.append(compute_hd95(p_np, t_np))
-    hd_mean = float(np.nanmean(hd_vals)) if hd_vals else float("nan")
+        out[f"dice_{name}"] = compute_dice(p_c, t_c)
+        out[f"iou_{name}"] = compute_iou(p_c, t_c)
 
-    return {"dice": float(dice), "iou": float(iou), "hd95": hd_mean}
+        hd_vals = []
+        for b in range(p_c.shape[0]):
+            p_np = p_c[b, 0].detach().cpu().numpy()
+            t_np = t_c[b, 0].detach().cpu().numpy()
+            hd_vals.append(compute_hd95(p_np, t_np))
+        out[f"hd95_{name}"] = float(np.nanmean(hd_vals)) if hd_vals else float("nan")
+
+    return out
 
 
 class MetricTracker:

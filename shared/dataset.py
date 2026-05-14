@@ -7,10 +7,10 @@ Each member instantiates this class with the modality they own:
     - member4: 't2f'
     - member5: 'multimodal'
 
-The class returns binary tumour masks by default (background vs whole tumour).
-Members who need fine-grained TC/ET targets remap labels in their own model
-forward pass; we keep this dataset minimal so its behaviour is identical for
-every pipeline.
+The class returns a 3-channel WT/TC/ET target tensor (BraTS protocol). Each
+channel is an independent binary mask; channels are overlapping by
+construction (ET ⊂ TC ⊂ WT). Loss and metrics treat them as independent
+binary tasks (sigmoid per channel — never softmax).
 """
 from __future__ import annotations
 
@@ -36,9 +36,6 @@ try:
     _HAVE_MONAI_CACHE = True
 except ImportError:  # pragma: no cover
     _HAVE_MONAI_CACHE = False
-
-
-_VALID_MODALITIES = {"t1n", "t1c", "t2f", "t2w", "multimodal"}
 
 
 def load_splits(splits_dir: str) -> dict:
@@ -120,36 +117,59 @@ class BraTSDataset(Dataset):
             return preprocess_patient_multimodal(pdir)
         return preprocess_patient(pdir, self.modality)
 
-    def _binary_label(self, seg: np.ndarray) -> np.ndarray:
-        """Merge label values 2 (TC) and 4 (ET) into a single tumour mask."""
-        return (seg > 0).astype(np.int64)
+    def _multichannel_label(self, seg: np.ndarray) -> np.ndarray:
+        """Build a (3, H, W, D) binary target with channels (WT, TC, ET).
+
+        From the raw integer segmentation (labels 0-4):
+            WT = whole tumour    = (seg == 1) | (seg == 2) | (seg == 3)
+            TC = tumour core     = (seg == 1) | (seg == 3)
+            ET = enhancing       = (seg == 3)
+        Label 4 (resection cavity) is excluded per BraTS 2024 protocol.
+
+        Channels are overlapping by construction: ET ⊂ TC ⊂ WT. Each
+        channel is treated as an independent binary task by the loss.
+        """
+        wt = (seg == 1) | (seg == 2) | (seg == 3)
+        tc = (seg == 1) | (seg == 3)
+        et = (seg == 3)
+        return np.stack([wt, tc, et], axis=0).astype(np.int64)
 
     def __getitem__(self, idx: int) -> dict:
         patient_idx = idx // self.patches_per_volume
         patient_id = self.patient_ids[patient_idx]
 
         vol, seg = self._load_volume(patient_id)
-        # Binary task — members needing per-class labels remap inside their model.
-        seg_bin = self._binary_label(seg)
 
-        patch_vol, patch_seg = extract_patch(
+        # Build the 3-channel WT/TC/ET target from the raw integer seg first,
+        # then crop it with the same window extract_patch picked for the image.
+        target_3ch = self._multichannel_label(seg)             # (3, H, W, D) int64
+
+        # extract_patch needs a 3D mask for tumour-aware sampling.
+        seg_for_sampling = (seg > 0).astype(np.int64)
+
+        patch_vol, _, (starts, ends) = extract_patch(
             vol,
-            seg_bin,
+            seg_for_sampling,
             size=self.patch_size,
             tumour_bias=self.tumour_bias,
         )
+        s = tuple(slice(int(a), int(b)) for a, b in zip(starts, ends))
+        patch_target = target_3ch[(slice(None),) + s]          # (3, P, P, P)
 
         if self._aug is not None:
             data = {
                 "image": torch.from_numpy(patch_vol).float(),
-                "label": torch.from_numpy(patch_seg.astype(np.int64)).unsqueeze(0),
+                "label": torch.from_numpy(patch_target).float(),
             }
             data = self._aug(data)
             image = data["image"].float()
-            label = data["label"].squeeze(0).long()
+            label = data["label"].float()
         else:
             image = torch.from_numpy(patch_vol).float()
-            label = torch.from_numpy(patch_seg.astype(np.int64)).long()
+            label = torch.from_numpy(patch_target).float()
+
+        assert label.shape == (3, self.patch_size, self.patch_size, self.patch_size), \
+            f"Expected label shape (3,P,P,P); got {label.shape}"
 
         return {"image": image, "label": label, "patient_id": patient_id}
 
