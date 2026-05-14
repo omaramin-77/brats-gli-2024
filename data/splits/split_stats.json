@@ -9,5 +9,8 @@
   "tumor_fraction_mean_val": 0.009772971904451172,
   "tumor_fraction_mean_test": 0.010117204458151847,
   "created_by": "create_splits.py",
-  "note": "Do not re-run this script. All members load from these files."
+  "note": "Do not re-run this script. All members load from these files.",
+  "et_positive_train": 204,
+  "et_positive_val": 24,
+  "et_positive_test": 26
 }
