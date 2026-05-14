@@ -27,6 +27,8 @@ from shared.config import (  # noqa: E402
     AMP_ENABLED,
     BATCH_SIZE,
     CHECKPOINT_DIR,
+    FIGURES_DIR,
+    GLOBAL_SEED,
     LR,
     MLRUNS_DIR,
     NUM_EPOCHS,
@@ -87,6 +89,9 @@ def deep_supervision_loss(outputs, target) -> torch.Tensor:
 
 
 def main() -> None:
+    import time
+    train_start = time.time()
+
     data_root = get_data_root()
     splits = load_splits(SPLITS_DIR)
 
@@ -104,15 +109,16 @@ def main() -> None:
         data_root=data_root,
         split_file=str(SPLITS_DIR / "val_ids.txt"),
         modality=MODALITY,
-        patch_size=patch_side,
         augment=False,
-        patches_per_volume=1,
+        full_volume=True,                  # full-volume eval, SWI tiles internally
     )
 
     train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     val_loader = get_dataloader(val_ds, batch_size=1, shuffle=False, num_workers=NUM_WORKERS)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     model = build_model().to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
@@ -136,8 +142,23 @@ def main() -> None:
         mlflow = None
         mlflow_run = None
 
+    if mlflow is not None:
+        mlflow.log_param("member",       MEMBER_NAME)
+        mlflow.log_param("modality",     MODALITY)
+        mlflow.log_param("architecture", "ResidualUNet3D")
+        mlflow.log_param("seed",         GLOBAL_SEED)
+        mlflow.log_param("batch_size",   BATCH_SIZE)
+        mlflow.log_param("lr",           LR)
+        mlflow.log_param("weight_decay", WEIGHT_DECAY)
+        mlflow.log_param("num_epochs",   NUM_EPOCHS)
+        mlflow.log_param("patch_size",   PATCH_SIZE)
+        mlflow.log_param("amp",          AMP_ENABLED)
+
     print("Dataloaders created")
     print("Starting epochs...")
+
+    from collections import defaultdict
+    history = defaultdict(list)
 
     best_dice = -1.0
     try:
@@ -147,6 +168,7 @@ def main() -> None:
                 model, train_loader, optimizer, scaler, device, deep_supervision_loss
             )
             print(f"[epoch {epoch:03d}] train_loss={train_metrics['loss']:.4f}")
+            history["train_loss"].append(train_metrics["loss"])
             if mlflow is not None:
                 mlflow.log_metric("train_loss", train_metrics["loss"], step=epoch)
 
@@ -173,6 +195,12 @@ def main() -> None:
                     for k, v in val_metrics.items():
                         mlflow.log_metric(f"val_{k}", v, step=epoch)
 
+                for key in ("dice_wt", "dice_tc", "dice_et",
+                            "iou_wt", "iou_tc", "iou_et",
+                            "hd95_wt", "hd95_tc", "hd95_et"):
+                    history[f"val_{key}"].append(val_metrics.get(key, float("nan")))
+                history["lr"].append(optimizer.param_groups[0]["lr"])
+
                 current_wt = val_metrics.get("dice_wt", -1.0)
                 is_best = current_wt > best_dice
                 if is_best:
@@ -184,6 +212,35 @@ def main() -> None:
                     print(f"[epoch {epoch:03d}] early stopping triggered")
                     break
     finally:
+        training_time_hrs = (time.time() - train_start) / 3600.0
+        gpu_memory_gb = (
+            torch.cuda.max_memory_allocated(device) / 1e9
+            if device.type == "cuda" else 0.0
+        )
+        print(f"[train] total time: {training_time_hrs:.2f} h, peak GPU mem: {gpu_memory_gb:.2f} GB")
+
+        if mlflow is not None:
+            mlflow.log_metric("training_time_hrs", training_time_hrs)
+            mlflow.log_metric("gpu_memory_gb",     gpu_memory_gb)
+
+        # Sidecar JSON so evaluate.py can read training metadata.
+        import json
+        sidecar = CHECKPOINT_DIR / f"{MEMBER_NAME}_train_meta.json"
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({
+            "training_time_hrs": training_time_hrs,
+            "gpu_memory_gb":     gpu_memory_gb,
+        }, indent=2), encoding="utf-8")
+
+        # Save training curves figure (Phase 1 acceptance criterion).
+        from shared.visualization import plot_training_curves
+        curves_path = FIGURES_DIR / f"training_curves_{MEMBER_NAME}.png"
+        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+        plot_training_curves(dict(history), MEMBER_NAME, save_path=str(curves_path))
+        print(f"[train] saved training curves to {curves_path}")
+        if mlflow is not None:
+            mlflow.log_artifact(str(curves_path))
+
         if mlflow is not None and mlflow_run is not None:
             mlflow.end_run()
 

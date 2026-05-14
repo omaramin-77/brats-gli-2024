@@ -36,6 +36,7 @@ CSV_FIELDNAMES = [
     "dice_wt", "dice_tc", "dice_et",
     "iou_wt", "iou_tc", "iou_et",
     "hd95_wt", "hd95_tc", "hd95_et",
+    "training_time_hrs", "gpu_memory_gb",
 ]
 
 
@@ -47,6 +48,7 @@ def main() -> None:
         split_file=SPLITS_DIR / "test_ids.txt",
         modality="t1n",
         augment=False,
+        full_volume=True,
     )
     test_loader = get_dataloader(test_ds, batch_size=1, shuffle=False)
 
@@ -59,6 +61,15 @@ def main() -> None:
 
     metrics = validate_one_epoch(model, test_loader, device)
 
+    # Pick up training_time_hrs / gpu_memory_gb from the sidecar JSON
+    # written by train.py; fall back to NaN if absent.
+    import json
+    sidecar_path = CHECKPOINT_DIR / f"{MEMBER_NAME}_train_meta.json"
+    if sidecar_path.exists():
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    else:
+        sidecar = {"training_time_hrs": float("nan"), "gpu_memory_gb": float("nan")}
+
     # M1 now outputs 3 channels (WT, TC, ET); validate_one_epoch
     # returns all 9 per-subregion metrics via compute_all_metrics.
     row = {
@@ -69,12 +80,14 @@ def main() -> None:
         "dice_wt": metrics.get("dice_wt", float("nan")),
         "dice_tc": metrics.get("dice_tc", float("nan")),
         "dice_et": metrics.get("dice_et", float("nan")),
-        "iou_wt":  metrics.get("iou_wt", float("nan")),
-        "iou_tc":  metrics.get("iou_tc", float("nan")),
-        "iou_et":  metrics.get("iou_et", float("nan")),
+        "iou_wt":  metrics.get("iou_wt",  float("nan")),
+        "iou_tc":  metrics.get("iou_tc",  float("nan")),
+        "iou_et":  metrics.get("iou_et",  float("nan")),
         "hd95_wt": metrics.get("hd95_wt", float("nan")),
         "hd95_tc": metrics.get("hd95_tc", float("nan")),
         "hd95_et": metrics.get("hd95_et", float("nan")),
+        "training_time_hrs": sidecar["training_time_hrs"],
+        "gpu_memory_gb":     sidecar["gpu_memory_gb"],
     }
 
     csv_path = TABLES_DIR / "test_metrics.csv"
