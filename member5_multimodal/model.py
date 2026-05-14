@@ -14,12 +14,11 @@ import torch.nn as nn
 class MultimodalSegModel(nn.Module):
     """TODO: implement multimodal encoder-decoder.
 
-    Input shape: (B, 4, H, W, D)
-    Output shape: (B, 1, H, W, D) for binary tumour mask, or (B, C, H, W, D)
-    if member 5 chooses to predict per-class TC/ET separately.
+    Input shape:  (B, 4, H, W, D)  — channel order (t1c, t1n, t2f, t2w)
+    Output shape: (B, 3, H, W, D)  — WT/TC/ET logits (BraTS protocol)
     """
 
-    def __init__(self, in_channels: int = 4, out_channels: int = 1):
+    def __init__(self, in_channels: int = 4, out_channels: int = 3):
         super().__init__()
         # TODO: encoder/decoder/classifier
         raise NotImplementedError

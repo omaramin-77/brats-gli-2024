@@ -27,4 +27,10 @@ def set_global_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as e:
+        # Some ops do not have deterministic implementations on every device;
+        # warn_only=True lets training continue rather than crash.
+        print(f"[seed] use_deterministic_algorithms: {e}")
     print(f"[seed] Global seed set to {seed}")

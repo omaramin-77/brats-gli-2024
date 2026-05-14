@@ -15,7 +15,13 @@ if str(REPO_ROOT) not in sys.path:
 from shared.seed import set_global_seed  # noqa: E402
 set_global_seed()
 
-from shared.config import *  # noqa: E402,F401,F403
+from shared.config import (  # noqa: E402
+    AMP_ENABLED, BATCH_SIZE, LR, NUM_EPOCHS, NUM_WORKERS, PATCH_SIZE,
+    PATIENCE, VAL_EVERY_N_EPOCHS, WEIGHT_DECAY,
+    CHECKPOINT_DIR, FIGURES_DIR, MLRUNS_DIR, SPLITS_DIR, TABLES_DIR,
+    TARGET_CHANNELS, TARGET_CHANNEL_NAMES, BEST_METRIC, GLOBAL_SEED,
+    get_data_root,
+)
 from shared.dataset import BraTSDataset, get_dataloader, load_splits  # noqa: E402,F401
 
 

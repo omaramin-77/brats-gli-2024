@@ -11,6 +11,13 @@ The class returns a 3-channel WT/TC/ET target tensor (BraTS protocol). Each
 channel is an independent binary mask; channels are overlapping by
 construction (ET ⊂ TC ⊂ WT). Loss and metrics treat them as independent
 binary tasks (sigmoid per channel — never softmax).
+
+full_volume mode
+----------------
+When full_volume=True, __getitem__ returns the entire 128³ preprocessed
+volume plus the (3,128,128,128) target — no patches, no augmentation,
+no tumour-biased sampling. Use this for validation and test loaders.
+Training loaders must use the default patch-based mode.
 """
 from __future__ import annotations
 
@@ -76,6 +83,7 @@ class BraTSDataset(Dataset):
         tumour_bias: float = 0.8,
         augment: bool = False,
         patches_per_volume: int = 4,
+        full_volume: bool = False,
     ):
         VALID_MODALITIES = {"t1n", "t1c", "t2w", "t2f", "multimodal"}
         if modality not in VALID_MODALITIES:
@@ -84,6 +92,16 @@ class BraTSDataset(Dataset):
                 f"Must be one of {sorted(VALID_MODALITIES)}."
             )
 
+        if full_volume:
+            if augment:
+                raise ValueError(
+                    "full_volume=True is for evaluation only; augment must be False."
+                )
+            if patches_per_volume != 1:
+                # Force exactly one item per patient in full-volume mode.
+                patches_per_volume = 1
+
+        self.full_volume = bool(full_volume)
         self.data_root = data_root
         self.modality = modality
         self.patch_size = int(patch_size)
@@ -143,6 +161,13 @@ class BraTSDataset(Dataset):
         # Build the 3-channel WT/TC/ET target from the raw integer seg first,
         # then crop it with the same window extract_patch picked for the image.
         target_3ch = self._multichannel_label(seg)             # (3, H, W, D) int64
+
+        if self.full_volume:
+            # Return the full preprocessed volume + target. Sliding-window
+            # inference in validate_one_epoch will tile this internally.
+            image = torch.from_numpy(vol).float()              # (C, H, W, D)
+            label = torch.from_numpy(target_3ch).float()       # (3, H, W, D)
+            return {"image": image, "label": label, "patient_id": patient_id}
 
         # extract_patch needs a 3D mask for tumour-aware sampling.
         seg_for_sampling = (seg > 0).astype(np.int64)

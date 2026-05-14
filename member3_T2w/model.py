@@ -13,7 +13,7 @@ import torch.nn as nn
 class T2wSegModel(nn.Module):
     """TODO: implement encoder-decoder for T2w."""
 
-    def __init__(self, in_channels: int = 1, out_channels: int = 1):
+    def __init__(self, in_channels: int = 1, out_channels: int = 3):
         super().__init__()
         # TODO: encoder/decoder/classifier
         raise NotImplementedError

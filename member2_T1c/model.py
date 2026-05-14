@@ -14,7 +14,7 @@ import torch.nn as nn
 class T1cSegModel(nn.Module):
     """TODO: implement encoder-decoder for T1c."""
 
-    def __init__(self, in_channels: int = 1, out_channels: int = 1):
+    def __init__(self, in_channels: int = 1, out_channels: int = 3):
         super().__init__()
         # TODO: encoder
         # TODO: decoder

@@ -152,7 +152,19 @@ def dice_bce_loss(
     else:
         dice_loss = dice_per_ch.mean()
 
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target)
+    # Per-channel BCE matched to the per-channel Dice reduction so the rare
+    # ET channel is not dwarfed by WT in the gradient.
+    bce_per_voxel = F.binary_cross_entropy_with_logits(
+        pred_logits, target, reduction="none"
+    )
+    spatial_dims = tuple(range(2, pred_logits.ndim))
+    bce_per_ch = bce_per_voxel.mean(dim=spatial_dims)         # (B, C)
+    if channel_weights is not None:
+        w = torch.as_tensor(channel_weights, device=pred_logits.device,
+                            dtype=bce_per_ch.dtype)
+        bce = (bce_per_ch * w).sum(dim=1).mean() / w.sum()
+    else:
+        bce = bce_per_ch.mean()
     return dice_weight * dice_loss + bce_weight * bce
 
 
@@ -171,7 +183,9 @@ def focal_loss(
     p_t = probs * target + (1 - probs) * (1 - target)
     focal_w = (1 - p_t) ** gamma
     alpha_w = alpha * target + (1 - alpha) * (1 - target)
-    return (alpha_w * focal_w * bce).mean()
+    loss_per_voxel = alpha_w * focal_w * bce                  # (B, C, ...)
+    spatial_dims = tuple(range(2, pred_logits.ndim))
+    return loss_per_voxel.mean(dim=spatial_dims).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +209,6 @@ def train_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        if labels.dim() == 4:
-            labels = labels.unsqueeze(1)  # ensure (B, 1, H, W, D)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -241,8 +253,6 @@ def validate_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        if labels.dim() == 4:
-            labels = labels.unsqueeze(1)
 
         if _HAVE_SWI:
             logits = sliding_window_inference(
