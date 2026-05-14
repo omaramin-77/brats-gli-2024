@@ -35,7 +35,13 @@ class EarlyStopper:
         self.best_dice: float = -float("inf")
         self.bad_checks: int = 0
 
-    def should_stop(self, val_dice: float) -> bool:
+    def should_stop(self, val_metric) -> bool:
+        # Accept dict (preferred — pulls BEST_METRIC) or float (legacy).
+        if isinstance(val_metric, dict):
+            from shared.config import BEST_METRIC
+            val_dice = float(val_metric.get(BEST_METRIC, -1.0))
+        else:
+            val_dice = float(val_metric)
         if val_dice > self.best_dice + self.min_delta:
             print(f"[early-stop] val Dice improved {self.best_dice:.4f} -> {val_dice:.4f}")
             self.best_dice = val_dice
@@ -68,12 +74,21 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         epoch: int,
-        val_dice: float,
+        val_metrics,                # float or dict
         is_best: bool = False,
+        best_metric_key: str = "dice_wt",
     ) -> None:
+        if isinstance(val_metrics, dict):
+            val_dice = float(val_metrics.get(best_metric_key, 0.0))
+            metric_payload = dict(val_metrics)
+        else:
+            val_dice = float(val_metrics)
+            metric_payload = {"val_dice": val_dice}
         payload = {
             "epoch": int(epoch),
-            "val_dice": float(val_dice),
+            "val_dice": val_dice,
+            "val_metrics": metric_payload,
+            "best_metric_key": best_metric_key,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
         }
@@ -113,27 +128,64 @@ def dice_bce_loss(
     target: torch.Tensor,
     dice_weight: float = 1.0,
     bce_weight: float = 0.5,
+    channel_weights = None,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Combined soft-Dice + binary cross-entropy loss.
-
-    Plain cross-entropy alone fails on BraTS because tumour voxels make up
-    less than 1 % of the volume — the network can drive the BCE loss towards
-    its minimum simply by predicting all-background. The soft-Dice term is
-    invariant to that imbalance because it normalises by the union, so adding
-    it puts pressure on the model to actually overlap the tumour mask.
-    """
+    """Per-channel soft-Dice + BCE. Reduces over spatial dims only,
+    then averages over batch and channel. Backward-compatible with
+    single-channel input."""
     target = target.float()
     if target.shape != pred_logits.shape:
         target = target.view_as(pred_logits)
 
     probs = torch.sigmoid(pred_logits)
-    inter = (probs * target).sum()
-    denom = probs.sum() + target.sum()
-    dice_loss = 1.0 - (2.0 * inter + eps) / (denom + eps)
+    # Spatial dims only — assume (B, C, ...spatial).
+    dims = tuple(range(2, pred_logits.ndim))
+    inter = (probs * target).sum(dim=dims)          # (B, C)
+    denom = probs.sum(dim=dims) + target.sum(dim=dims)
+    dice_per_ch = 1.0 - (2.0 * inter + eps) / (denom + eps)   # (B, C)
 
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target)
+    if channel_weights is not None:
+        w = torch.as_tensor(channel_weights, device=pred_logits.device,
+                            dtype=dice_per_ch.dtype)
+        dice_loss = (dice_per_ch * w).sum(dim=1).mean() / w.sum()
+    else:
+        dice_loss = dice_per_ch.mean()
+
+    # Per-channel BCE matched to the per-channel Dice reduction so the rare
+    # ET channel is not dwarfed by WT in the gradient.
+    bce_per_voxel = F.binary_cross_entropy_with_logits(
+        pred_logits, target, reduction="none"
+    )
+    spatial_dims = tuple(range(2, pred_logits.ndim))
+    bce_per_ch = bce_per_voxel.mean(dim=spatial_dims)         # (B, C)
+    if channel_weights is not None:
+        w = torch.as_tensor(channel_weights, device=pred_logits.device,
+                            dtype=bce_per_ch.dtype)
+        bce = (bce_per_ch * w).sum(dim=1).mean() / w.sum()
+    else:
+        bce = bce_per_ch.mean()
     return dice_weight * dice_loss + bce_weight * bce
+
+
+def focal_loss(
+    pred_logits: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+) -> torch.Tensor:
+    """Per-channel focal loss for severely imbalanced binary tasks."""
+    target = target.float()
+    if target.shape != pred_logits.shape:
+        target = target.view_as(pred_logits)
+    bce = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
+    probs = torch.sigmoid(pred_logits)
+    p_t = probs * target + (1 - probs) * (1 - target)
+    focal_w = (1 - p_t) ** gamma
+    alpha_w = alpha * target + (1 - alpha) * (1 - target)
+    loss_per_voxel = alpha_w * focal_w * bce                  # (B, C, ...)
+    spatial_dims = tuple(range(2, pred_logits.ndim))
+    return loss_per_voxel.mean(dim=spatial_dims).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -157,13 +209,11 @@ def train_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        if labels.dim() == 4:
-            labels = labels.unsqueeze(1)  # ensure (B, 1, H, W, D)
 
         optimizer.zero_grad(set_to_none=True)
 
         if use_amp:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type="cuda"):
                 logits = model(images)
                 loss = loss_fn(logits, labels)
             scaler.scale(loss).backward()
@@ -203,8 +253,6 @@ def validate_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
-        if labels.dim() == 4:
-            labels = labels.unsqueeze(1)
 
         if _HAVE_SWI:
             logits = sliding_window_inference(

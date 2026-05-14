@@ -232,8 +232,10 @@ Once training has produced a `best.pt`:
 - **xai_analysis.py** restores the best checkpoint, picks a target layer
   (the bottleneck or the conv just before the final 1×1×1 classifier),
   wraps it in `GradCAM3D`, generates heatmaps for a handful of test cases,
-  and saves overlays via `plot_gradcam_overlay`. Always call
-  `cam.remove_hooks()` at the end.
+  and saves overlays via `plot_gradcam_overlay`. **Always use `GradCAM3D`
+  as a context manager** — `with GradCAM3D(model, layer) as cam: ...` —
+  so hooks are released even if the body raises. Bare instantiation +
+  `remove_hooks()` is fragile and will leak GPU memory on any exception.
 
 ---
 

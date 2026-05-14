@@ -140,13 +140,18 @@ def extract_patch(
     seg: np.ndarray,
     size: int = 64,
     tumour_bias: float = 0.8,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, tuple[tuple[int, ...], tuple[int, ...]]]:
     """Sample a ``size``-cubed patch from ``vol`` (C, H, W, D) and ``seg`` (H, W, D).
 
     With probability ``tumour_bias`` the centre is drawn from a tumour voxel
     so the network sees positive examples — random sampling alone would yield
     almost entirely background patches because tumours occupy <1 % of the
     volume on average.
+
+    Returns ``(patch_vol, patch_seg, (starts, ends))`` where ``starts`` and
+    ``ends`` are the per-axis crop bounds used. The caller can reuse this
+    window to crop a sibling array (e.g. a 3-channel target) so it lines up
+    exactly with ``patch_vol`` / ``patch_seg``.
     """
     if vol.ndim != 4:
         raise ValueError(f"vol must be 4D (C,H,W,D); got shape {vol.shape}")
@@ -177,7 +182,11 @@ def extract_patch(
     s = tuple(slice(int(a), int(b)) for a, b in zip(starts, ends))
     patch_vol = vol[(slice(None),) + s]
     patch_seg = seg[s]
-    return patch_vol, patch_seg
+    return (
+        patch_vol,
+        patch_seg,
+        (tuple(int(x) for x in starts), tuple(int(x) for x in ends)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +270,10 @@ def preprocess_patient_multimodal(
     # Crop slices come from T1c; reapply to every other modality + seg.
     _, seg_c, slc = crop_to_brain(vols["t1c"], seg)
     cropped = {m: vols[m][slc] for m in vols}
+
+    shapes = {m: cropped[m].shape for m in cropped}
+    unique_shapes = set(shapes.values())
+    assert len(unique_shapes) == 1, f"Cropped modalities have inconsistent shapes: {shapes}"
 
     resized = {m: resize_volume(cropped[m], target_size, order=1) for m in cropped}
     seg_r = resize_volume(seg_c, target_size, order=0)

@@ -101,6 +101,8 @@ def main() -> None:
     expected_uni = (1, patch_side, patch_side, patch_side)
     if tuple(item["image"].shape) != expected_uni:
         fail(f"unimodal patch shape {tuple(item['image'].shape)} != {expected_uni}")
+    if tuple(item["label"].shape) != (3, patch_side, patch_side, patch_side):
+        fail(f"unimodal LABEL shape {tuple(item['label'].shape)} != (3,P,P,P)")
 
     ds_multi = BraTSDataset(
         data_root=data_root,
@@ -114,16 +116,67 @@ def main() -> None:
     expected_multi = (4, patch_side, patch_side, patch_side)
     if tuple(item_m["image"].shape) != expected_multi:
         fail(f"multimodal patch shape {tuple(item_m['image'].shape)} != {expected_multi}")
+    if tuple(item_m["label"].shape) != (3, patch_side, patch_side, patch_side):
+        fail(f"multimodal LABEL shape {tuple(item_m['label'].shape)} != (3,P,P,P)")
     print(f"[sanity] patch unimod: {expected_uni}  OK")
     print(f"[sanity] patch multim: {expected_multi}  OK")
 
     # --- Step 11: loss smoke test -----------------------------------------
-    pred = torch.randn(1, 1, patch_side, patch_side, patch_side)
-    target = (torch.rand(1, 1, patch_side, patch_side, patch_side) > 0.7).float()
+    pred = torch.randn(1, 3, patch_side, patch_side, patch_side)
+    target = (torch.rand(1, 3, patch_side, patch_side, patch_side) > 0.7).float()
     loss = dice_bce_loss(pred, target)
     if not torch.isfinite(loss):
         fail(f"dice_bce_loss returned non-finite value: {loss.item()}")
     print(f"[sanity] loss        : {loss.item():.4f}  OK")
+
+    # --- Step 11a: 9-key metrics smoke test --------------------------------
+    from shared.metrics import compute_all_metrics
+    m = compute_all_metrics(pred, target)
+    expected_keys = {"dice_wt", "dice_tc", "dice_et",
+                    "iou_wt", "iou_tc", "iou_et",
+                    "hd95_wt", "hd95_tc", "hd95_et"}
+    missing = expected_keys - set(m.keys())
+    if missing:
+        fail(f"compute_all_metrics missing keys: {missing}")
+    print(f"[sanity] metrics     : 9 keys present OK")
+
+    # --- Step 11b: GradCAM3D context-manager smoke test --------------------
+    import torch.nn as nn
+    from shared.grad_cam_3d import GradCAM3D
+
+    class _SanityTinyNet(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = nn.Conv3d(1, 4, 3, padding=1)
+            self.head = nn.Conv3d(4, 3, 1)
+
+        def forward(self, x):
+            return self.head(self.encoder(x))
+
+    cam_net = _SanityTinyNet()
+    cam_net.eval()
+    target_layer = cam_net.encoder
+    hooks_before = len(target_layer._forward_hooks) + len(target_layer._backward_hooks)
+    cam_input = torch.randn(1, 1, 16, 16, 16)
+    with GradCAM3D(cam_net, target_layer) as cam:
+        heatmap = cam.generate(cam_input)
+    hooks_after = len(target_layer._forward_hooks) + len(target_layer._backward_hooks)
+    if heatmap.shape != (16, 16, 16):
+        fail(f"GradCAM3D heatmap shape {heatmap.shape} != (16,16,16)")
+    if heatmap.min() < 0.0 or heatmap.max() > 1.0 + 1e-5:
+        fail(f"GradCAM3D heatmap range [{heatmap.min():.3f},{heatmap.max():.3f}] outside [0,1]")
+    if hooks_after != hooks_before:
+        fail("GradCAM3D context manager leaked hooks on exit")
+    print(f"[sanity] gradcam3d   : shape={heatmap.shape} range=[{heatmap.min():.3f},{heatmap.max():.3f}]  OK")
+
+    for ch in ("wt", "tc", "et"):
+        with GradCAM3D(cam_net, target_layer) as cam:
+            hmap = cam.generate(cam_input, target_channel=ch)
+        if hmap.shape != (16, 16, 16):
+            fail(f"GradCAM3D(target_channel={ch}) heatmap shape {hmap.shape}")
+        if hmap.min() < 0.0 or hmap.max() > 1.0 + 1e-5:
+            fail(f"GradCAM3D(target_channel={ch}) range out of [0,1]")
+    print(f"[sanity] gradcam3d   : per-channel (wt/tc/et) OK")
 
     # --- Step 12: figure --------------------------------------------------
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)

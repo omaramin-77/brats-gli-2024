@@ -53,24 +53,15 @@ else:
 from shared.seed import set_global_seed
 set_global_seed()  # always first
 
-from shared.config import (
+from shared.config import (  # noqa: E402
+    AMP_ENABLED, BATCH_SIZE, LR, NUM_EPOCHS, NUM_WORKERS, PATCH_SIZE,
+    PATIENCE, VAL_EVERY_N_EPOCHS, WEIGHT_DECAY,
+    CHECKPOINT_DIR, FIGURES_DIR, MLRUNS_DIR, SPLITS_DIR, TABLES_DIR,
+    TARGET_CHANNELS, TARGET_CHANNEL_NAMES, BEST_METRIC, GLOBAL_SEED,
     get_data_root,
-    SPLITS_DIR,
-    CHECKPOINT_DIR,
-    BATCH_SIZE,
-    NUM_EPOCHS,
-    PATIENCE,
-    VAL_EVERY_N_EPOCHS,
-    LR,
-    WEIGHT_DECAY,
-    AMP_ENABLED,
-    PATCH_SIZE,
 )
-from shared.dataset import BraTSDataset, get_dataloader
-from shared.trainer import EarlyStopper, CheckpointManager, dice_bce_loss
+from shared.dataset import BraTSDataset, get_dataloader, load_splits  # noqa: E402,F401
 
-# ── Member-specific imports ───────────────────────────────────────────────────
-from model import build_model
 
 MEMBER_NAME = "member4_T2f"
 MODALITY    = "t2f"

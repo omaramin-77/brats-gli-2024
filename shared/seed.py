@@ -6,6 +6,7 @@ reproducible across machines.
 """
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
@@ -18,6 +19,7 @@ def set_global_seed(seed: int = 42) -> None:
     Note: cuDNN benchmark must be False — when True, cuDNN picks the fastest
     convolution algorithm at runtime, which is non-deterministic across runs.
     """
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -25,4 +27,10 @@ def set_global_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception as e:
+        # Some ops do not have deterministic implementations on every device;
+        # warn_only=True lets training continue rather than crash.
+        print(f"[seed] use_deterministic_algorithms: {e}")
     print(f"[seed] Global seed set to {seed}")

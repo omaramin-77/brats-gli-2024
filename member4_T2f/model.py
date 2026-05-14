@@ -126,7 +126,7 @@ class T2fSegResNet(nn.Module):
       • Competitive with full U-Net on BraTS whole-tumour Dice
     """
 
-    def __init__(self, in_channels: int = 1, out_channels: int = 1, init_filters: int = 32):
+    def __init__(self, in_channels: int = 1, out_channels: int = 3):
         super().__init__()
         self.arch_name = "SegResNet"
 
