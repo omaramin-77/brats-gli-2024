@@ -9,7 +9,7 @@ data/raw/*
 
 # local data path override — never commit
 data/raw/DATA_PATH.local.txt
-
+data/raw/subset
 # Preprocessed cache (regenerable from raw + shared/preprocessing.py)
 data/processed/
 
@@ -44,5 +44,16 @@ Thumbs.db
 *.env
 *.log
 
+mlruns/
+mlartifacts/
+mlflow.db
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env/
 # Claude Code working files — never commit
 .claude/

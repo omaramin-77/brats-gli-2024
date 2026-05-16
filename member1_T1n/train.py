@@ -27,6 +27,8 @@ from shared.config import (  # noqa: E402
     AMP_ENABLED,
     BATCH_SIZE,
     CHECKPOINT_DIR,
+    FIGURES_DIR,
+    GLOBAL_SEED,
     LR,
     MLRUNS_DIR,
     NUM_EPOCHS,
@@ -47,17 +49,49 @@ from shared.trainer import (  # noqa: E402
     validate_one_epoch,
 )
 
+from member1_T1n.model import ResidualUNet3D  # noqa: E402
 
-MEMBER_NAME = "member1_T1n"
+
+MEMBER_NAME = "M1_T1n_ResUNet"
 MODALITY = "t1n"
+# MLflow run name follows claude.md §3.8: 'M{N}-{MODALITY}-{ArchName}-seed42'.
+MLFLOW_RUN_NAME = "M1-T1n-ResUNet-seed42"
+
+# Deep-supervision auxiliary loss weights (plan.md M1):
+# L_total = L_main + 0.5*L_aux2 + 0.25*L_aux3 + 0.125*L_aux4
+DEEP_SUPERVISION_WEIGHTS = (0.5, 0.25, 0.125)
 
 
 def build_model() -> torch.nn.Module:
-    """TODO: instantiate your T1n model from member1_T1n/model.py."""
-    raise NotImplementedError("Member 1: import T1nSegModel and return it here.")
+    """Instantiate the M1 T1n architecture (3D Residual U-Net + deep supervision)."""
+    return ResidualUNet3D(in_channels=1, out_channels=3)
+
+
+def deep_supervision_loss(outputs, target) -> torch.Tensor:
+    """Aggregate dice_bce_loss across the model's main + auxiliary outputs.
+
+    During training the model returns a 4-tuple
+    ``(main, aux2, aux3, aux4)``; during evaluation it returns a single
+    tensor (the main prediction). This wrapper handles both so the same
+    callable can be passed to ``train_one_epoch`` and
+    ``validate_one_epoch`` without branching at the call site.
+    """
+    if isinstance(outputs, tuple):
+        main, aux2, aux3, aux4 = outputs
+        w2, w3, w4 = DEEP_SUPERVISION_WEIGHTS
+        return (
+            dice_bce_loss(main, target)
+            + w2 * dice_bce_loss(aux2, target)
+            + w3 * dice_bce_loss(aux3, target)
+            + w4 * dice_bce_loss(aux4, target)
+        )
+    return dice_bce_loss(outputs, target)
 
 
 def main() -> None:
+    import time
+    train_start = time.time()
+
     data_root = get_data_root()
     splits = load_splits(SPLITS_DIR)
 
@@ -75,59 +109,140 @@ def main() -> None:
         data_root=data_root,
         split_file=str(SPLITS_DIR / "val_ids.txt"),
         modality=MODALITY,
-        patch_size=patch_side,
         augment=False,
-        patches_per_volume=1,
+        full_volume=True,                  # full-volume eval, SWI tiles internally
     )
 
-    train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = get_dataloader(val_ds, batch_size=1, shuffle=False, num_workers=NUM_WORKERS)
+    train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=6)
+    val_loader = get_dataloader(val_ds, batch_size=1, shuffle=False, num_workers=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     model = build_model().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {total_params:,}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler = torch.cuda.amp.GradScaler() if (AMP_ENABLED and device.type == "cuda") else None
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+    scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    scaler = torch.amp.GradScaler("cuda") if (AMP_ENABLED and device.type == "cuda") else None
 
     stopper = EarlyStopper(patience=PATIENCE)
     ckpt = CheckpointManager(save_dir=str(CHECKPOINT_DIR), member_name=MEMBER_NAME)
 
-    # TODO: configure MLflow tracking — uncomment after you `pip install mlflow`.
-    # import mlflow
-    # mlflow.set_tracking_uri(MLRUNS_DIR.as_uri())
-    # mlflow.set_experiment(MEMBER_NAME)
-    # mlflow.start_run()
+    # MLflow tracking. Imported lazily so a plain ``import member1_T1n.train``
+    # has no side-effects beyond seeding/config; if mlflow is not installed,
+    # training continues without logging rather than failing.
+    try:
+        import mlflow  # type: ignore
+        mlflow.set_tracking_uri(MLRUNS_DIR.as_uri())
+        mlflow.set_experiment(MEMBER_NAME)
+        mlflow_run = mlflow.start_run(run_name=MLFLOW_RUN_NAME)
+    except ImportError:
+        mlflow = None
+        mlflow_run = None
+
+    if mlflow is not None:
+        mlflow.log_param("member",       MEMBER_NAME)
+        mlflow.log_param("modality",     MODALITY)
+        mlflow.log_param("architecture", "ResidualUNet3D")
+        mlflow.log_param("seed",         GLOBAL_SEED)
+        mlflow.log_param("batch_size",   BATCH_SIZE)
+        mlflow.log_param("lr",           LR)
+        mlflow.log_param("weight_decay", WEIGHT_DECAY)
+        mlflow.log_param("num_epochs",   NUM_EPOCHS)
+        mlflow.log_param("patch_size",   PATCH_SIZE)
+        mlflow.log_param("amp",          AMP_ENABLED)
+
+    print("Dataloaders created")
+    print("Starting epochs...")
+
+    from collections import defaultdict
+    history = defaultdict(list)
 
     best_dice = -1.0
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, dice_bce_loss)
-        print(f"[epoch {epoch:03d}] train_loss={train_metrics['loss']:.4f}")
-        # mlflow.log_metric("train_loss", train_metrics["loss"], step=epoch)
-
-        # Members 2-5: copy this condition exactly — do not use epoch % N alone.
-        # The `or epoch == NUM_EPOCHS` clause guarantees a final validation when
-        # NUM_EPOCHS is not a multiple of VAL_EVERY_N_EPOCHS, otherwise the
-        # last training step's state never reaches EarlyStopper / CheckpointManager.
-        if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == NUM_EPOCHS:
-            val_metrics = validate_one_epoch(model, val_loader, device, dice_bce_loss)
-            print(
-                f"[epoch {epoch:03d}] val_loss={val_metrics['loss']:.4f} "
-                f"dice={val_metrics.get('dice', float('nan')):.4f} "
-                f"iou={val_metrics.get('iou', float('nan')):.4f} "
-                f"hd95={val_metrics.get('hd95', float('nan')):.2f}"
+    try:
+        for epoch in range(1, NUM_EPOCHS + 1):
+            print(f"Epoch {epoch} starting...")
+            train_metrics = train_one_epoch(
+                model, train_loader, optimizer, scaler, device, deep_supervision_loss
             )
-            # for k, v in val_metrics.items():
-            #     mlflow.log_metric(f"val_{k}", v, step=epoch)
+            print(f"[epoch {epoch:03d}] train_loss={train_metrics['loss']:.4f}")
+            history["train_loss"].append(train_metrics["loss"])
+            if mlflow is not None:
+                mlflow.log_metric("train_loss", train_metrics["loss"], step=epoch)
 
-            is_best = val_metrics.get("dice", -1.0) > best_dice
-            if is_best:
-                best_dice = val_metrics["dice"]
-            ckpt.save(model, optimizer, epoch, val_metrics.get("dice", 0.0), is_best=is_best)
+            scheduler.step()
+            if mlflow is not None:
+                mlflow.log_metric("lr", optimizer.param_groups[0]["lr"], step=epoch)
 
-            if stopper.should_stop(val_metrics.get("dice", -1.0)):
-                print(f"[epoch {epoch:03d}] early stopping triggered")
-                break
+            # Members 2-5: copy this condition exactly — do not use epoch % N alone.
+            # The `or epoch == NUM_EPOCHS` clause guarantees a final validation when
+            # NUM_EPOCHS is not a multiple of VAL_EVERY_N_EPOCHS, otherwise the
+            # last training step's state never reaches EarlyStopper / CheckpointManager.
+            if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == NUM_EPOCHS:
+                val_metrics = validate_one_epoch(
+                    model, val_loader, device, deep_supervision_loss
+                )
+                print(
+                    f"[epoch {epoch:03d}] val_loss={val_metrics.get('loss', 0.0):.4f} "
+                    f"WT={val_metrics.get('dice_wt', float('nan')):.4f} "
+                    f"TC={val_metrics.get('dice_tc', float('nan')):.4f} "
+                    f"ET={val_metrics.get('dice_et', float('nan')):.4f} "
+                    f"HD95_WT={val_metrics.get('hd95_wt', float('nan')):.2f}"
+                )
+                if mlflow is not None:
+                    for k, v in val_metrics.items():
+                        mlflow.log_metric(f"val_{k}", v, step=epoch)
 
-    # mlflow.end_run()
+                for key in ("dice_wt", "dice_tc", "dice_et",
+                            "iou_wt", "iou_tc", "iou_et",
+                            "hd95_wt", "hd95_tc", "hd95_et"):
+                    history[f"val_{key}"].append(val_metrics.get(key, float("nan")))
+                history["lr"].append(optimizer.param_groups[0]["lr"])
+
+                current_wt = val_metrics.get("dice_wt", -1.0)
+                is_best = current_wt > best_dice
+                if is_best:
+                    best_dice = current_wt
+                ckpt.save(model, optimizer, epoch, val_metrics, is_best=is_best,
+                          best_metric_key="dice_wt")
+
+                if stopper.should_stop(val_metrics):
+                    print(f"[epoch {epoch:03d}] early stopping triggered")
+                    break
+    finally:
+        training_time_hrs = (time.time() - train_start) / 3600.0
+        gpu_memory_gb = (
+            torch.cuda.max_memory_allocated(device) / 1e9
+            if device.type == "cuda" else 0.0
+        )
+        print(f"[train] total time: {training_time_hrs:.2f} h, peak GPU mem: {gpu_memory_gb:.2f} GB")
+
+        if mlflow is not None:
+            mlflow.log_metric("training_time_hrs", training_time_hrs)
+            mlflow.log_metric("gpu_memory_gb",     gpu_memory_gb)
+
+        # Sidecar JSON so evaluate.py can read training metadata.
+        import json
+        sidecar = CHECKPOINT_DIR / f"{MEMBER_NAME}_train_meta.json"
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({
+            "training_time_hrs": training_time_hrs,
+            "gpu_memory_gb":     gpu_memory_gb,
+        }, indent=2), encoding="utf-8")
+
+        # Save training curves figure (Phase 1 acceptance criterion).
+        from shared.visualization import plot_training_curves
+        curves_path = FIGURES_DIR / f"training_curves_{MEMBER_NAME}.png"
+        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+        plot_training_curves(dict(history), MEMBER_NAME, save_path=str(curves_path))
+        print(f"[train] saved training curves to {curves_path}")
+        if mlflow is not None:
+            mlflow.log_artifact(str(curves_path))
+
+        if mlflow is not None and mlflow_run is not None:
+            mlflow.end_run()
 
 
 if __name__ == "__main__":
