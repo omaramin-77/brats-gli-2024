@@ -89,7 +89,7 @@ def dice_focal_loss(pred_logits, target):
     the BCE weighting in the primary loss.
     """
     dice_only = dice_bce_loss(pred_logits, target, dice_weight=1.0, bce_weight=0.0)
-    focal = focal_loss(pred_logits, target, gamma=2.0, alpha=0.25)
+    focal = focal_loss(pred_logits, target, gamma=2.0, alpha=0.5)
     return dice_only + 0.5 * focal
 
 
@@ -140,8 +140,8 @@ def main() -> None:
         full_volume=True,                  # full-volume eval, SWI tiles internally
     )
 
-    train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = get_dataloader(val_ds, batch_size=1, shuffle=False, num_workers=NUM_WORKERS)
+    train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=6)
+    val_loader = get_dataloader(val_ds, batch_size=1, shuffle=False, num_workers=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
