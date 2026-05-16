@@ -83,6 +83,12 @@ def dice_focal_loss(pred_logits, target):
 
 
 def main() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Training requires CUDA. No GPU detected — check your conda env / "
+            "CUDA toolkit. Set CUDA_VISIBLE_DEVICES if you have multiple GPUs."
+        )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--loss", choices=["dicebce", "focal"], default="dicebce")
     args = parser.parse_args()
