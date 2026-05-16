@@ -1,19 +1,32 @@
-"""Member 4 — T2f explainability: Grad-CAM + SHAP on both architectures.
+"""Member 4 — T2f explainability: per-sub-region Grad-CAM + SHAP.
 
-Produces, for each architecture × each test patient:
-  1. Grad-CAM overlay (axial / coronal / sagittal) — fast
-  2. SHAP importance map (run overnight with --shap_bg 20)
-  3. Side-by-side Grad-CAM comparison: ResUNet3D vs SegResNet
+Produces per patient × per sub-region × per view:
+  • 9 Grad-CAM PNGs per patient (3 sub-regions × 3 views) — 27 PNGs for 3 patients
+  • Architecture comparison PNGs (ResUNet3D vs SegResNet, axial only)
+  • SHAP importance maps per sub-region (run with --shap_bg N)
+  • Pearson r agreement score between Grad-CAM and SHAP
 
-Also computes Pearson r agreement between Grad-CAM and SHAP maps.
+Filename format (claude.md §3.9):
+  gradcam_M4_{pid}_{subregion}_{view}.png
+  shap_M4_{pid}_{subregion}_axial.png
+
+Conventions (claude.md):
+  • set_global_seed() first.
+  • GradCAM3D always used as context manager (§2.5).
+  • target_channel specified per sub-region — never full-channel average (§2.8).
+  • test_metrics.csv guard enforces evaluate → xai order (§2.4).
+  • Full-volume inputs for GradCAM (not patches).
 
 Usage:
-  python xai_analysis.py                    # Grad-CAM only, 3 patients
-  python xai_analysis.py --shap_bg 20       # adds SHAP (slow)
-  python xai_analysis.py --n_patients 5     # more patients
-  python xai_analysis.py --arch resunet     # single arch
+  python xai_analysis.py                          # Grad-CAM only, 3 patients
+  python xai_analysis.py --n_patients 3 --shap_bg 20   # + SHAP (slow)
+  python xai_analysis.py --arch resunet           # single arch
 """
 from __future__ import annotations
+
+# ── Seed first ────────────────────────────────────────────────────────────────
+from shared.seed import set_global_seed
+set_global_seed()
 
 import argparse
 import os
@@ -21,13 +34,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")          # headless on Kaggle
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import torch
-import torch.nn.functional as F
 from tqdm.auto import tqdm
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 IS_KAGGLE = os.path.exists('/kaggle/working')
@@ -49,312 +61,268 @@ else:
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
-from shared.seed import set_global_seed
-set_global_seed()
-
 from shared.config import (
+    CHECKPOINT_DIR, FIGURES_DIR, PATCH_SIZE, SPLITS_DIR, TABLES_DIR,
+    TARGET_CHANNEL_NAMES,
     get_data_root,
-    SPLITS_DIR,
-    CHECKPOINT_DIR,
-    PATCH_SIZE,
 )
+from shared.grad_cam_3d import GradCAM3D
 from shared.preprocessing import preprocess_patient
 from shared.trainer import CheckpointManager
+from shared.visualization import plot_gradcam_three_view
 
 from model import build_model
 
 MODALITY    = "t2f"
-FIGURES_DIR = RESULTS_ROOT / "T2F" / "figures"
-TABLES_DIR  = RESULTS_ROOT / "T2F" / "tables"
-FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-TABLES_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_FIGS  = RESULTS_ROOT / "T2F" / "figures"
+LOCAL_FIGS.mkdir(parents=True, exist_ok=True)
+LOCAL_TABS  = RESULTS_ROOT / "T2F" / "tables"
+LOCAL_TABS.mkdir(parents=True, exist_ok=True)
 
-# ── Test-set contamination guard ──────────────────────────────────────────────
-_metrics_csv = TABLES_DIR / "test_metrics.csv"
-if not _metrics_csv.exists():
-    raise RuntimeError(
-        "\n\ntest_metrics.csv not found.\n"
-        "Run evaluate.py BEFORE xai_analysis.py.\n"
-        f"Expected: {_metrics_csv}\n"
-    )
+# ── Sub-regions (frozen order — claude.md §3.4) ───────────────────────────────
+SUBREGIONS = TARGET_CHANNEL_NAMES   # ("wt", "tc", "et")
+VIEWS      = ("axial", "coronal", "sagittal")
 
-# Colour palette
-TEAL   = "#5DCAA5"
-AMBER  = "#EF9F27"
-BG     = "#0D1117"
-PANEL  = "#161B22"
+BG_COLOR = "#0D1117"
+TEAL     = "#5DCAA5"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Grad-CAM
+# Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GradCAM3D:
-    """Lightweight Grad-CAM context manager for 3D models."""
-
-    def __init__(self, model: torch.nn.Module, target_layer: torch.nn.Module):
-        self.model  = model
-        self._feats: dict = {}
-        self._grads: dict = {}
-        self._h1    = target_layer.register_forward_hook(
-            lambda m, i, o: self._feats.update({"f": o})
-        )
-        self._h2    = target_layer.register_full_backward_hook(
-            lambda m, gi, go: self._grads.update({"g": go[0]})
-        )
-
-    def generate(self, vol_tensor: torch.Tensor) -> np.ndarray:
-        """Return (D,H,W) heatmap in [0,1]."""
-        self.model.zero_grad()
-        pred  = self.model(vol_tensor)
-        prob  = torch.sigmoid(pred)
-        score = (prob * (prob > 0.5).float()).sum()
-        score.backward()
-
-        weights = self._grads["g"].mean(dim=(2, 3, 4), keepdim=True)
-        cam     = F.relu((weights * self._feats["f"]).sum(dim=1, keepdim=True))
-        cam     = F.interpolate(cam, size=vol_tensor.shape[2:],
-                                mode="trilinear", align_corners=False)
-        cam_np  = cam.squeeze().detach().cpu().numpy()
-
-        if cam_np.max() > 1e-6:
-            cam_np = (cam_np - cam_np.min()) / (cam_np.max() - cam_np.min())
-        return cam_np
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self._h1.remove()
-        self._h2.remove()
+def _peak_slice(seg_3ch: np.ndarray, subregion: str) -> dict[str, int]:
+    """Return {axial, coronal, sagittal} peak slice indices for a sub-region."""
+    ch = {"wt": 0, "tc": 1, "et": 2}[subregion]
+    mask = seg_3ch[ch]   # (D, H, W)
+    if mask.sum() == 0:
+        D, H, W = mask.shape
+        return {"axial": D // 2, "coronal": H // 2, "sagittal": W // 2}
+    return {
+        "axial":    int(mask.sum(axis=(1, 2)).argmax()),
+        "coronal":  int(mask.sum(axis=(0, 2)).argmax()),
+        "sagittal": int(mask.sum(axis=(0, 1)).argmax()),
+    }
 
 
-def get_gradcam_layer(model: torch.nn.Module):
-    """Return the last encoder layer to hook for Grad-CAM."""
-    layers = model.get_encoder_layers()
-    if layers:
-        return layers[-1]
-    # Fallback for SegResNet MONAI internals
-    try:
-        return list(model._net.encoder)[-1]
-    except Exception:
-        return None
+def _extract_slice(arr: np.ndarray, view: str, idx: int) -> np.ndarray:
+    if view == "axial":    return arr[idx]
+    if view == "coronal":  return arr[:, idx, :]
+    return arr[:, :, idx]
+
+
+def _save_gradcam_figure(
+    vol_np:     np.ndarray,   # (D, H, W)
+    cam_np:     np.ndarray,   # (D, H, W)
+    seg_3ch:    np.ndarray,   # (3, D, H, W)
+    subregion:  str,
+    view:       str,
+    idx:        int,
+    arch_name:  str,
+    pid:        str,
+    save_path:  Path,
+) -> None:
+    """3-panel: FLAIR | GT overlay | Grad-CAM overlay for one view/sub-region."""
+    mri_s = _extract_slice(vol_np, view, idx)
+    cam_s = _extract_slice(cam_np, view, idx)
+    ch    = {"wt": 0, "tc": 1, "et": 2}[subregion]
+    gt_s  = _extract_slice(seg_3ch[ch], view, idx)
+
+    sr_colours = {"wt": "#5DCAA5", "tc": "#EF9F27", "et": "#FF4B4B"}
+    sr_colour  = sr_colours[subregion]
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), facecolor=BG_COLOR)
+    labels = [f"FLAIR — {view} z={idx}", f"GT ({subregion.upper()})", f"Grad-CAM ({subregion.upper()})"]
+
+    for ax in axes:
+        ax.set_facecolor(BG_COLOR)
+        ax.imshow(mri_s.T, cmap="gray", origin="lower", interpolation="bilinear")
+        ax.axis("off")
+
+    if gt_s.sum() > 0:
+        axes[1].contour(gt_s.T, levels=[0.5], colors=[sr_colour], linewidths=1.8)
+    axes[2].imshow(cam_s.T, cmap="inferno", alpha=0.60, origin="lower", vmin=0, vmax=1)
+    if gt_s.sum() > 0:
+        axes[2].contour(gt_s.T, levels=[0.5], colors=[sr_colour], linewidths=1.4)
+
+    for ax, lbl in zip(axes, labels):
+        ax.set_title(lbl, color="white", fontsize=9, pad=4)
+
+    fig.suptitle(f"M4 {arch_name} | {pid} | {subregion.upper()} | {view}",
+                 color="white", fontsize=10, y=0.99)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(save_path, dpi=120, bbox_inches="tight", facecolor=BG_COLOR)
+    plt.close(fig)
+
+
+def _arch_comparison_figure(
+    vol_np:    np.ndarray,
+    seg_3ch:   np.ndarray,
+    cam_dict:  dict[str, np.ndarray],   # arch_name → cam_np
+    subregion: str,
+    pid:       str,
+    save_path: Path,
+) -> None:
+    """Side-by-side Grad-CAM per arch for one sub-region (axial only)."""
+    ch  = {"wt": 0, "tc": 1, "et": 2}[subregion]
+    z   = _peak_slice(seg_3ch, subregion)["axial"]
+    mri = vol_np[z]
+    gt  = seg_3ch[ch, z]
+
+    n   = 1 + len(cam_dict)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), facecolor=BG_COLOR)
+
+    axes[0].imshow(mri.T, cmap="gray", origin="lower")
+    if gt.sum() > 0:
+        axes[0].contour(gt.T, levels=[0.5], colors=[TEAL], linewidths=1.8)
+    axes[0].set_title(f"FLAIR z={z} | {subregion.upper()}", color="white", fontsize=10)
+    axes[0].axis("off")
+
+    cmaps = ["inferno", "plasma"]
+    for idx, (arch_name, cam_np) in enumerate(cam_dict.items()):
+        ax = axes[idx + 1]
+        ax.imshow(mri.T, cmap="gray", origin="lower")
+        ax.imshow(cam_np[z].T, cmap=cmaps[idx % 2], alpha=0.55, origin="lower", vmin=0, vmax=1)
+        if gt.sum() > 0:
+            ax.contour(gt.T, levels=[0.5], colors=[TEAL], linewidths=1.4)
+        ax.set_title(f"Grad-CAM | {arch_name}", color="white", fontsize=10)
+        ax.axis("off")
+
+    fig.suptitle(f"Arch comparison — {pid} | {subregion.upper()}", color="white", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches="tight", facecolor=BG_COLOR)
+    plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHAP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_shap(model, vol_tensor: torch.Tensor, n_bg: int = 20) -> np.ndarray | None:
-    """Compute SHAP GradientExplainer importance map. Returns (D,H,W) or None."""
+def compute_shap_per_subregion(
+    model:     torch.nn.Module,
+    vol_t:     torch.Tensor,
+    n_bg:      int,
+    subregion: str,
+) -> np.ndarray | None:
+    """SHAP GradientExplainer for one sub-region. Returns (D,H,W) map or None."""
     try:
         import shap
     except ImportError:
-        print("  [SHAP] shap not installed — pip install shap")
+        print("  [SHAP] pip install shap")
         return None
 
+    ch = {"wt": 0, "tc": 1, "et": 2}[subregion]
     model.eval()
-    background = [
-        torch.randn_like(vol_tensor) * 0.1  # near-zero background samples
-        for _ in range(n_bg)
-    ]
-    background_t = torch.cat(background, dim=0)  # (n_bg, 1, D, H, W)
 
-    def model_fn(x):
+    # Background: near-zero random patches
+    bg = torch.randn(n_bg, *vol_t.shape[1:]) * 0.05
+
+    def model_fn(x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return torch.sigmoid(model(x)).squeeze(1).reshape(x.shape[0], -1)
+            logits = model(x)
+            return torch.sigmoid(logits[:, ch:ch+1]).squeeze(1).reshape(x.shape[0], -1)
 
     try:
-        explainer   = shap.GradientExplainer(model, background_t)
-        shap_values = explainer.shap_values(vol_tensor)  # list or array
-        if isinstance(shap_values, list):
-            shap_values = shap_values[0]
-        shap_map = np.abs(shap_values).squeeze()
+        explainer   = shap.GradientExplainer(model, bg)
+        shap_vals   = explainer.shap_values(vol_t)
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[0]
+        shap_map = np.abs(shap_vals).squeeze()
         if shap_map.max() > 1e-9:
             shap_map = (shap_map - shap_map.min()) / (shap_map.max() - shap_map.min())
         return shap_map
     except Exception as e:
-        print(f"  [SHAP] Failed: {e}")
+        print(f"  [SHAP] Error: {e}")
         return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Visualisation helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _best_slices(seg_np: np.ndarray) -> tuple[int, int, int]:
-    tumour = (seg_np > 0)
-    z = int(tumour.sum(axis=(1, 2)).argmax()) if tumour.any() else seg_np.shape[0] // 2
-    y = int(tumour.sum(axis=(0, 2)).argmax()) if tumour.any() else seg_np.shape[1] // 2
-    x = int(tumour.sum(axis=(0, 1)).argmax()) if tumour.any() else seg_np.shape[2] // 2
-    return z, y, x
-
-
-def plot_gradcam_overlay(
-    vol_np: np.ndarray,
-    seg_np: np.ndarray,
-    cam_np: np.ndarray,
-    title:  str,
+def _save_shap_figure(
+    vol_np:    np.ndarray,
+    cam_np:    np.ndarray,
+    shap_map:  np.ndarray,
+    seg_3ch:   np.ndarray,
+    subregion: str,
+    pearson_r: float,
+    arch_name: str,
+    pid:       str,
     save_path: Path,
 ) -> None:
-    """3×2 grid: (row0=MRI+GT, row1=Grad-CAM) × (axial, coronal, sagittal)."""
-    z, y, x = _best_slices(seg_np)
-    tumour   = (seg_np > 0).astype(np.float32)
+    ch  = {"wt": 0, "tc": 1, "et": 2}[subregion]
+    z   = _peak_slice(seg_3ch, subregion)["axial"]
+    mri = vol_np[z]
+    gt  = seg_3ch[ch, z]
+    sr  = subregion.upper()
+    lvl = "HIGH" if pearson_r > 0.7 else "MODERATE" if pearson_r > 0.4 else "LOW"
 
-    views = [
-        ("Axial",    vol_np[z],        tumour[z],        cam_np[z]),
-        ("Coronal",  vol_np[:, y, :],  tumour[:, y, :],  cam_np[:, y, :]),
-        ("Sagittal", vol_np[:, :, x],  tumour[:, :, x],  cam_np[:, :, x]),
-    ]
-
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9), facecolor=BG)
-    fig.suptitle(title, color="white", fontsize=13, y=0.98)
-
-    for col, (name, mri, gt, heat) in enumerate(views):
-        for row in range(2):
-            ax = axes[row, col]
-            ax.set_facecolor(PANEL)
-            ax.imshow(mri.T, cmap="gray", origin="lower", interpolation="bilinear")
-
-            if row == 1:           # Grad-CAM row
-                ax.imshow(heat.T, cmap="inferno", alpha=0.55,
-                          origin="lower", vmin=0, vmax=1)
-
-            if gt.sum() > 0:
-                ax.contour(gt.T, levels=[0.5], colors=[TEAL], linewidths=1.4)
-
-            label = name if row == 0 else f"Grad-CAM | {name}"
-            ax.set_title(label, color="white", fontsize=9, pad=3)
-            ax.axis("off")
-
-    # Row labels
-    for row, label in enumerate(["Raw FLAIR + GT contour", "Grad-CAM overlay"]):
-        axes[row, 0].set_ylabel(label, color="#aaa", fontsize=8, rotation=90, labelpad=5)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    plt.savefig(save_path, dpi=130, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
-    print(f"  Saved: {save_path.name}")
-
-
-def plot_arch_comparison(
-    vol_np:    np.ndarray,
-    seg_np:    np.ndarray,
-    cam_dict:  dict,          # {arch_name: cam_np}
-    patient_id: str,
-    save_path:  Path,
-) -> None:
-    """Side-by-side Grad-CAM: ResUNet3D vs SegResNet (axial only)."""
-    z = _best_slices(seg_np)[0]
-    tumour = (seg_np > 0).astype(np.float32)
-    mri_z  = vol_np[z]
-    gt_z   = tumour[z]
-
-    n_cols = 1 + len(cam_dict)        # MRI | arch1 | arch2
-    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5), facecolor=BG)
-
-    # MRI panel
-    axes[0].imshow(mri_z.T, cmap="gray", origin="lower")
-    if gt_z.sum() > 0:
-        axes[0].contour(gt_z.T, levels=[0.5], colors=[TEAL], linewidths=1.5)
-    axes[0].set_title(f"FLAIR — axial z={z}", color="white", fontsize=10)
-    axes[0].axis("off")
-
-    colours = ["inferno", "plasma"]
-    for idx, (arch_name, cam_np) in enumerate(cam_dict.items()):
-        ax = axes[idx + 1]
-        ax.imshow(mri_z.T, cmap="gray", origin="lower")
-        ax.imshow(cam_np[z].T, cmap=colours[idx % 2], alpha=0.55,
-                  origin="lower", vmin=0, vmax=1)
-        if gt_z.sum() > 0:
-            ax.contour(gt_z.T, levels=[0.5], colors=[TEAL], linewidths=1.5)
-        ax.set_title(f"Grad-CAM | {arch_name}", color="white", fontsize=10)
-        ax.axis("off")
-
-    fig.suptitle(f"Arch Comparison — {patient_id}", color="white", fontsize=12, y=1.01)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=130, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
-    print(f"  Saved: {save_path.name}")
-
-
-def plot_shap_vs_gradcam(
-    vol_np:     np.ndarray,
-    seg_np:     np.ndarray,
-    cam_np:     np.ndarray,
-    shap_map:   np.ndarray,
-    pearson_r:  float,
-    arch_name:  str,
-    patient_id: str,
-    save_path:  Path,
-) -> None:
-    """3-panel: MRI | Grad-CAM | SHAP with agreement score."""
-    z      = _best_slices(seg_np)[0]
-    tumour = (seg_np > 0).astype(np.float32)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=BG)
-    titles = ["FLAIR + GT", f"Grad-CAM ({arch_name})", f"SHAP ({arch_name})"]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor=BG_COLOR)
+    titles = [f"FLAIR + GT ({sr})", f"Grad-CAM ({sr})", f"SHAP ({sr})"]
     maps   = [None, cam_np[z], shap_map[z] if shap_map.ndim == 3 else shap_map]
     cmaps  = ["gray", "inferno", "viridis"]
     alphas = [1.0, 0.55, 0.55]
 
     for ax, title, hmap, cmap, alpha in zip(axes, titles, maps, cmaps, alphas):
-        ax.imshow(vol_np[z].T, cmap="gray", origin="lower")
+        ax.set_facecolor(BG_COLOR)
+        ax.imshow(mri.T, cmap="gray", origin="lower")
         if hmap is not None:
             ax.imshow(hmap.T, cmap=cmap, alpha=alpha, origin="lower", vmin=0, vmax=1)
-        if tumour[z].sum() > 0:
-            ax.contour(tumour[z].T, levels=[0.5], colors=[TEAL], linewidths=1.5)
+        if gt.sum() > 0:
+            ax.contour(gt.T, levels=[0.5], colors=[TEAL], linewidths=1.5)
         ax.set_title(title, color="white", fontsize=10)
         ax.axis("off")
 
     fig.suptitle(
-        f"{patient_id} | Pearson r = {pearson_r:.3f} "
-        f"({'HIGH' if pearson_r > 0.7 else 'MODERATE' if pearson_r > 0.4 else 'LOW'} agreement)",
-        color="white", fontsize=12,
+        f"{pid} | {arch_name} | {sr} | Pearson r={pearson_r:.3f} ({lvl} agreement)",
+        color="white", fontsize=11,
     )
     plt.tight_layout()
-    plt.savefig(save_path, dpi=130, bbox_inches="tight", facecolor=BG)
+    plt.savefig(save_path, dpi=120, bbox_inches="tight", facecolor=BG_COLOR)
     plt.close(fig)
-    print(f"  Saved: {save_path.name}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
+def main() -> None:
+    # ── Contamination guard (claude.md §2.4) ─────────────────────────────────
+    _guard = TABLES_DIR / "test_metrics.csv"
+    if not _guard.exists():
+        raise RuntimeError(
+            f"\n\ntest_metrics.csv not found at {_guard}\n"
+            "Run evaluate.py BEFORE xai_analysis.py to prevent test-set peeking."
+        )
+
     parser = argparse.ArgumentParser(description="M4 XAI analysis")
     parser.add_argument("--arch",       default="both",
                         choices=["resunet", "segresnet", "both"])
     parser.add_argument("--n_patients", type=int, default=3,
-                        help="Number of test patients to analyse")
-    parser.add_argument("--shap_bg",    type=int, default=0,
-                        help="SHAP background samples (0 = skip SHAP)")
+                        help="Number of test patients (first/middle/last from test_ids)")
+    parser.add_argument("--shap_bg",   type=int, default=0,
+                        help="SHAP background samples (0=skip SHAP, slow otherwise)")
     args = parser.parse_args()
 
-    archs      = ["resunet", "segresnet"] if args.arch == "both" else [args.arch]
-    device     = torch.device("cpu")   # XAI always on CPU
-    data_root  = get_data_root()
-    patch_size = PATCH_SIZE[0]
+    archs     = ["resunet", "segresnet"] if args.arch == "both" else [args.arch]
+    data_root = get_data_root()
 
-    # ── Load test patient IDs ─────────────────────────────────────────────────
-    test_ids_file = SPLITS_DIR / "test_ids.txt"
-    with open(test_ids_file) as f:
-        test_ids = [l.strip() for l in f if l.strip()]
-    test_ids = test_ids[: args.n_patients]
-    print(f"[XAI] Analysing {len(test_ids)} test patient(s)")
+    # ── Test patient IDs — first / middle / last (deterministic, diverse) ────
+    with open(SPLITS_DIR / "test_ids.txt") as f:
+        all_ids = [l.strip() for l in f if l.strip()]
+    n     = min(args.n_patients, len(all_ids))
+    idxs  = [0, len(all_ids) // 2, len(all_ids) - 1][:n]
+    pids  = [all_ids[i] for i in idxs]
+    print(f"[XAI] Patients: {pids}")
 
     # ── Load checkpoints ──────────────────────────────────────────────────────
-    models = {}
+    models: dict[str, torch.nn.Module] = {}
     for arch in archs:
         ckpt_name = f"member4_T2f_{arch}"
-        model     = build_model(arch, in_channels=1)
+        model     = build_model(arch, in_channels=1, out_channels=3)
         try:
-            manager = CheckpointManager(str(CHECKPOINT_DIR), ckpt_name)
-            model, _, epoch, val_dice = manager.load_best(model)
-            model.eval().to(device)
-            models[arch] = model
-            print(f"[XAI] Loaded {arch} (epoch={epoch}, val_dice={val_dice:.4f})")
+            mgr              = CheckpointManager(str(CHECKPOINT_DIR), ckpt_name)
+            model, _, ep, _  = mgr.load_best(model)
+            model.eval()
+            models[model.arch_name] = model
+            print(f"[XAI] Loaded {arch} epoch={ep}")
         except FileNotFoundError:
             print(f"[XAI] No checkpoint for '{arch}' — skipping")
 
@@ -365,86 +333,117 @@ def main():
     pearson_records = []
 
     # ── Per-patient analysis ──────────────────────────────────────────────────
-    for pid in tqdm(test_ids, desc="Patients"):
+    for pid in tqdm(pids, desc="Patients"):
         patient_dir = str(Path(data_root) / pid)
         print(f"\n[XAI] Patient: {pid}")
 
-        # Preprocess FLAIR volume
         try:
             vol, seg = preprocess_patient(patient_dir, MODALITY)
         except Exception as e:
             print(f"  [skip] preprocess failed: {e}")
             continue
 
-        vol_np  = vol.squeeze()
-        seg_np  = seg
-        vol_t   = torch.tensor(vol[np.newaxis]).float()  # (1,1,D,H,W)
+        vol_np  = vol.squeeze()       # (D, H, W)
+        seg_3ch = seg                 # (3, D, H, W) — WT/TC/ET channels
+        vol_t   = torch.tensor(vol[np.newaxis]).float()   # (1, 1, D, H, W)
 
-        cam_dict = {}   # arch_name → cam_np for comparison plot
+        # cam_dict_per_sr: arch_name → {sr: cam_np}
+        cam_store: dict[str, dict[str, np.ndarray]] = {}
 
         for arch_name, model in models.items():
-            print(f"  → {model.arch_name}")
-
-            # ── Grad-CAM ─────────────────────────────────────────────────────
-            target_layer = get_gradcam_layer(model)
-            if target_layer is None:
-                print("    [Grad-CAM] No target layer found — skipping")
+            print(f"  → {arch_name}")
+            layers = model.get_encoder_layers()
+            if not layers:
+                print("    [Grad-CAM] No encoder layers — skip")
                 continue
+            target_layer = layers[-1]   # enc4 — deepest, most semantic
+            cam_store[arch_name] = {}
 
-            with GradCAM3D(model, target_layer) as cam_gen:
-                cam_np = cam_gen.generate(vol_t)
+            for sr in SUBREGIONS:
+                # ── Grad-CAM per sub-region (claude.md §2.8) ─────────────────
+                with GradCAM3D(model, target_layer) as cam_gen:
+                    cam_np = cam_gen.generate(vol_t, target_channel=sr)
 
-            cam_dict[model.arch_name] = cam_np
+                cam_store[arch_name][sr] = cam_np
 
-            # Save Grad-CAM overlay
-            save_name = f"M4_gradcam_{arch_name}_{pid}_combined.png"
-            plot_gradcam_overlay(
-                vol_np, seg_np, cam_np,
-                title     = f"M4 Grad-CAM | {model.arch_name} | {pid}",
-                save_path = FIGURES_DIR / save_name,
-            )
-
-            # ── SHAP ─────────────────────────────────────────────────────────
-            if args.shap_bg > 0:
-                print(f"    [SHAP] running with {args.shap_bg} background samples …")
-                shap_map = compute_shap(model, vol_t, n_bg=args.shap_bg)
-
-                if shap_map is not None:
-                    from scipy.stats import pearsonr
-                    r, p = pearsonr(cam_np.flatten(), shap_map.flatten())
-                    level = "HIGH" if r > 0.7 else "MODERATE" if r > 0.4 else "LOW"
-                    print(f"    Grad-CAM vs SHAP: Pearson r={r:.4f} (p={p:.2e}) → {level}")
-                    pearson_records.append({
-                        "patient":    pid,
-                        "arch":       model.arch_name,
-                        "pearson_r":  round(r, 4),
-                        "p_value":    round(p, 6),
-                        "agreement":  level,
-                    })
-
-                    shap_save = FIGURES_DIR / f"M4_shap_{arch_name}_{pid}.png"
-                    plot_shap_vs_gradcam(
-                        vol_np, seg_np, cam_np, shap_map,
-                        pearson_r  = r,
-                        arch_name  = model.arch_name,
-                        patient_id = pid,
-                        save_path  = shap_save,
+                # 9 PNGs per patient: 3 sub-regions × 3 views
+                for view in VIEWS:
+                    idx  = _peak_slice(seg_3ch, sr)[view]
+                    name = f"gradcam_M4_{pid}_{sr}_{view}.png"
+                    _save_gradcam_figure(
+                        vol_np, cam_np, seg_3ch,
+                        subregion=sr, view=view, idx=idx,
+                        arch_name=arch_name, pid=pid,
+                        save_path=LOCAL_FIGS / name,
                     )
 
-        # ── Arch comparison plot (only when both models ran) ──────────────────
-        if len(cam_dict) >= 2:
-            comp_save = FIGURES_DIR / f"M4_arch_comparison_{pid}.png"
-            plot_arch_comparison(vol_np, seg_np, cam_dict, pid, comp_save)
+                # ── SHAP per sub-region ───────────────────────────────────────
+                if args.shap_bg > 0:
+                    print(f"    [SHAP] {sr.upper()} with {args.shap_bg} bg samples …")
+                    shap_map = compute_shap_per_subregion(
+                        model, vol_t, args.shap_bg, sr
+                    )
+                    if shap_map is not None:
+                        from scipy.stats import pearsonr
+                        r, p = pearsonr(cam_np.flatten(), shap_map.flatten())
+                        lvl  = "HIGH" if r > 0.7 else "MODERATE" if r > 0.4 else "LOW"
+                        print(f"    Grad-CAM vs SHAP {sr.upper()}: r={r:.4f} ({lvl})")
+                        pearson_records.append({
+                            "patient":    pid,
+                            "arch":       arch_name,
+                            "subregion":  sr,
+                            "pearson_r":  round(r, 4),
+                            "p_value":    round(float(p), 6),
+                            "agreement":  lvl,
+                        })
+                        shap_save = LOCAL_FIGS / f"shap_M4_{pid}_{sr}_axial.png"
+                        _save_shap_figure(
+                            vol_np, cam_np, shap_map, seg_3ch,
+                            subregion=sr, pearson_r=r,
+                            arch_name=arch_name, pid=pid,
+                            save_path=shap_save,
+                        )
+
+        # ── Architecture comparison (one per sub-region) ──────────────────────
+        if len(cam_store) >= 2:
+            for sr in SUBREGIONS:
+                cam_dict_for_sr = {
+                    arch: cams[sr]
+                    for arch, cams in cam_store.items()
+                    if sr in cams
+                }
+                if len(cam_dict_for_sr) >= 2:
+                    comp_save = LOCAL_FIGS / f"M4_arch_comparison_{pid}_{sr}.png"
+                    _arch_comparison_figure(
+                        vol_np, seg_3ch, cam_dict_for_sr, sr, pid, comp_save
+                    )
 
     # ── SHAP agreement summary ────────────────────────────────────────────────
     if pearson_records:
         import pandas as pd
         df = pd.DataFrame(pearson_records)
-        df.to_csv(TABLES_DIR / "M4_shap_agreement.csv", index=False)
-        print(f"\nSHAP agreement table saved to {TABLES_DIR}/M4_shap_agreement.csv")
+        df.to_csv(LOCAL_TABS / "M4_shap_agreement.csv", index=False)
+        print(f"\nSHAP agreement: {LOCAL_TABS}/M4_shap_agreement.csv")
         print(df.to_string(index=False))
 
-    print(f"\n[XAI] All figures saved to: {FIGURES_DIR}")
+        # Paragraph-length summary for the report (as a comment in the script)
+        # -------------------------------------------------------------------
+        # "For the FLAIR model, Grad-CAM and SHAP showed [HIGH/MODERATE/LOW]
+        # spatial agreement (mean Pearson r = X.XX ± Y.YY). Agreement was
+        # strongest for WT (r=...) and weakest for ET (r=...), consistent with
+        # the class-imbalance challenge for the smallest sub-region. Where
+        # agreement was high, Grad-CAM is validated as a reliable proxy for
+        # FLAIR-based tumour localisation. Where agreement was low (ET), SHAP
+        # is the more trustworthy explainability method."
+        # -------------------------------------------------------------------
+        mean_r = df["pearson_r"].mean()
+        print(f"\n  Mean Pearson r (all sub-regions): {mean_r:.4f}")
+        level = "HIGH" if mean_r > 0.7 else "MODERATE" if mean_r > 0.4 else "LOW"
+        print(f"  Overall XAI agreement: {level}")
+
+    print(f"\n[XAI] Figures saved to: {LOCAL_FIGS}")
+    print(f"[XAI] Expected files: {len(pids)} patients × {len(SUBREGIONS)} sub-regions"
+          f" × {len(VIEWS)} views = {len(pids)*len(SUBREGIONS)*len(VIEWS)} Grad-CAM PNGs")
     print("[XAI] Done ✓")
 
 

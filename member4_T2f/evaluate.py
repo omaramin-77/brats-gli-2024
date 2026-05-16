@@ -1,16 +1,28 @@
 """Member 4 — T2f (FLAIR) test-set evaluation.
 
-Evaluates BOTH trained checkpoints (ResUNet3D + SegResNet) on the test split,
-computes Dice_WT / IoU_WT / HD95_WT, prints a comparison table, and saves:
-  results/T2F/tables/M4_row.csv        ← your row for M5's comparison table
-  results/T2F/tables/M4_test_full.csv  ← per-architecture detail
+Evaluates BOTH trained checkpoints on the test split, computes all 9 BraTS
+metrics (Dice/IoU/HD95 × WT/TC/ET), and saves:
+  results/T2F/tables/M4_test_full.csv   — both architectures
+  results/tables/test_metrics.csv       — team-wide file, one row per model
+                                          (appended, not overwritten)
+
+Conventions (claude.md):
+  • set_global_seed() first.
+  • Full-volume inference only — never patch-based (§2.4b).
+  • Best checkpoint via CheckpointManager.load_best.
+  • Reports dice_wt, dice_tc, dice_et separately — BraTS protocol (§2.10).
+  • Writes test_metrics.csv so xai_analysis.py contamination guard passes.
 
 Usage:
-  python evaluate.py                        # evaluates both archs
-  python evaluate.py --arch resunet         # only ResUNet3D
-  python evaluate.py --arch segresnet       # only SegResNet
+  python evaluate.py                    # both archs
+  python evaluate.py --arch resunet
+  python evaluate.py --arch segresnet
 """
 from __future__ import annotations
+
+# ── Seed first ────────────────────────────────────────────────────────────────
+from shared.seed import set_global_seed
+set_global_seed()
 
 import argparse
 import os
@@ -42,58 +54,40 @@ else:
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
-from shared.seed import set_global_seed
-set_global_seed()
-
 from shared.config import (
+    CHECKPOINT_DIR, NUM_WORKERS, PATCH_SIZE, SPLITS_DIR, TABLES_DIR,
     get_data_root,
-    SPLITS_DIR,
-    CHECKPOINT_DIR,
-    PATCH_SIZE,
 )
 from shared.dataset import BraTSDataset, get_dataloader
-from shared.metrics import compute_all_metrics
+from shared.metrics import compute_all_metrics, MetricTracker
 from shared.trainer import CheckpointManager
 
 from model import build_model
 
-MODALITY   = "t2f"
-TABLES_DIR = RESULTS_ROOT / "T2F" / "tables"
-TABLES_DIR.mkdir(parents=True, exist_ok=True)
+MODALITY = "t2f"
+LOCAL_TABLES = RESULTS_ROOT / "T2F" / "tables"
+LOCAL_TABLES.mkdir(parents=True, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Evaluation loop for one model
+# Evaluation loop
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate_model(model: torch.nn.Module, loader, device) -> dict:
-    """Run model over loader, return mean Dice/IoU/HD95."""
+def evaluate_model(model: torch.nn.Module, loader, device: torch.device) -> dict:
+    """Full-volume inference → mean 9-metric dict."""
     model.eval()
-    all_dice, all_iou, all_hd95 = [], [], []
+    tracker = MetricTracker()
 
-    pbar = tqdm(loader, desc="  Evaluating", leave=False)
-    for batch in pbar:
+    for batch in tqdm(loader, desc="  Test inference", leave=False):
         images = batch["image"].to(device, non_blocking=True)
-        labels = batch["mask"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)   # (B,3,D,H,W)
 
-        # Ensure labels have channel dim: (B,1,D,H,W)
-        if labels.dim() == 4:
-            labels = labels.unsqueeze(1)
+        logits  = model(images)
+        metrics = compute_all_metrics(logits, labels)
+        tracker.update(metrics)
 
-        logits = model(images, return_features=False)
-        m      = compute_all_metrics(logits, labels)
-
-        all_dice.append(m["dice"])
-        all_iou.append(m["iou"])
-        all_hd95.append(m["hd95"])
-        pbar.set_postfix(dice=f"{m['dice']:.4f}")
-
-    return {
-        "dice_wt": float(np.nanmean(all_dice)),
-        "iou_wt":  float(np.nanmean(all_iou)),
-        "hd95_wt": float(np.nanmean(all_hd95)),
-    }
+    return tracker.compute()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -104,92 +98,113 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="M4 T2f evaluation")
     parser.add_argument("--arch", default="both",
                         choices=["resunet", "segresnet", "both"])
-    args   = parser.parse_args()
-    archs  = ["resunet", "segresnet"] if args.arch == "both" else [args.arch]
+    args  = parser.parse_args()
+    archs = ["resunet", "segresnet"] if args.arch == "both" else [args.arch]
 
-    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_root  = get_data_root()
-    patch_size = PATCH_SIZE[0]
+    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data_root = get_data_root()
+    patch_size = PATCH_SIZE[0] if isinstance(PATCH_SIZE, tuple) else PATCH_SIZE
+    nw        = NUM_WORKERS
 
-    # ── Test DataLoader (never seen during training) ──────────────────────────
-    nw = 4 if IS_KAGGLE else 0
+    # ── Test loader — full volumes (claude.md §2.4b) ──────────────────────────
     test_ds = BraTSDataset(
-        data_root          = data_root,
-        split_file         = str(SPLITS_DIR / "test_ids.txt"),
-        modality           = MODALITY,
-        patch_size         = patch_size,
-        augment            = False,
-        patches_per_volume = 2,
+        data_root  = data_root,
+        split_file = str(SPLITS_DIR / "test_ids.txt"),
+        modality   = MODALITY,
+        patch_size = patch_size,
+        augment    = False,
+        full_volume = True,
     )
     test_loader = get_dataloader(
         test_ds, batch_size=1, shuffle=False,
         num_workers=nw, pin_memory=(device.type == "cuda"),
         persistent_workers=(nw > 0),
     )
-    print(f"[M4-eval] device={device} | test_patches={len(test_ds)}")
+    print(f"[M4-eval] device={device} | test_volumes={len(test_ds)}")
 
     rows = []
     for arch in archs:
         ckpt_name = f"member4_T2f_{arch}"
-        model     = build_model(arch, in_channels=1)
+        model     = build_model(arch, in_channels=1, out_channels=3)
 
-        # Load best checkpoint
         try:
-            manager        = CheckpointManager(str(CHECKPOINT_DIR), ckpt_name)
-            model, _, epoch, val_dice = manager.load_best(model)
-            print(f"\n[{arch}] Loaded checkpoint (epoch={epoch}, val_dice={val_dice:.4f})")
+            mgr                          = CheckpointManager(str(CHECKPOINT_DIR), ckpt_name)
+            model, _, epoch, val_metrics = mgr.load_best(model)
+            val_dice_wt = (
+                val_metrics.get("dice_wt", val_metrics)
+                if isinstance(val_metrics, dict)
+                else float(val_metrics)
+            )
+            print(f"\n[{arch}] Loaded checkpoint epoch={epoch}  val_dice_wt={val_dice_wt:.4f}")
         except FileNotFoundError:
-            print(f"\n[{arch}] No checkpoint found at {CHECKPOINT_DIR}/{ckpt_name}_best.pt")
-            print(f"         → Run train.py --arch {arch} first")
+            print(f"\n[{arch}] No checkpoint at {CHECKPOINT_DIR}/{ckpt_name}_best.pt")
+            print(f"         → Run: python train.py --arch {arch}")
             continue
 
         model = model.to(device)
-        metrics = evaluate_model(model, test_loader, device)
+        m     = evaluate_model(model, test_loader, device)
 
         print(f"[{arch}] TEST RESULTS:")
-        print(f"  Dice_WT = {metrics['dice_wt']:.4f}")
-        print(f"  IoU_WT  = {metrics['iou_wt']:.4f}")
-        print(f"  HD95_WT = {metrics['hd95_wt']:.1f} mm")
+        print(f"  Dice  WT={m['dice_wt']:.4f}  TC={m['dice_tc']:.4f}  ET={m['dice_et']:.4f}")
+        print(f"  IoU   WT={m['iou_wt']:.4f}  TC={m['iou_tc']:.4f}  ET={m['iou_et']:.4f}")
+        print(f"  HD95  WT={m['hd95_wt']:.1f}  TC={m['hd95_tc']:.1f}  ET={m['hd95_et']:.1f} mm")
 
-        rows.append({
-            "Member":         "M4",
-            "Modality":       "T2f (FLAIR)",
-            "Architecture":   model.arch_name,
-            "Dice_WT":        round(metrics["dice_wt"], 4),
-            "IoU_WT":         round(metrics["iou_wt"],  4),
-            "HD95_WT":        round(metrics["hd95_wt"], 1),
-            "Val_Dice":       round(val_dice, 4),
-            "Best_Epoch":     epoch,
-        })
+        row = {
+            "member":        "M4",
+            "modality":      "T2f (FLAIR)",
+            "architecture":  model.arch_name,
+            # 9 BraTS metrics
+            "dice_wt":  round(m["dice_wt"],  4),
+            "dice_tc":  round(m["dice_tc"],  4),
+            "dice_et":  round(m["dice_et"],  4),
+            "iou_wt":   round(m["iou_wt"],   4),
+            "iou_tc":   round(m["iou_tc"],   4),
+            "iou_et":   round(m["iou_et"],   4),
+            "hd95_wt":  round(m["hd95_wt"],  1),
+            "hd95_tc":  round(m["hd95_tc"],  1),
+            "hd95_et":  round(m["hd95_et"],  1),
+            # bookkeeping
+            "val_dice_wt":  round(val_dice_wt, 4),
+            "best_epoch":   epoch,
+        }
+        rows.append(row)
 
     if not rows:
-        print("\n[M4-eval] No checkpoints found. Train first.")
+        print("\n[M4-eval] No checkpoints found. Run train.py first.")
         return
 
-    # ── Save results ──────────────────────────────────────────────────────────
-    df_full = pd.DataFrame(rows)
-    df_full.to_csv(TABLES_DIR / "M4_test_full.csv", index=False)
-    print(f"\nSaved: {TABLES_DIR / 'M4_test_full.csv'}")
+    df = pd.DataFrame(rows)
 
-    # Best row for M5's comparison table (highest Dice)
-    best = df_full.loc[df_full["Dice_WT"].idxmax()]
-    best_df = best.to_frame().T
-    best_df.to_csv(TABLES_DIR / "M4_row.csv", index=False)
-    print(f"Saved: {TABLES_DIR / 'M4_row.csv'}  ← share this with M5")
+    # ── Save local detail file ────────────────────────────────────────────────
+    df.to_csv(LOCAL_TABLES / "M4_test_full.csv", index=False)
+    print(f"\nSaved: {LOCAL_TABLES / 'M4_test_full.csv'}")
 
-    # ── Print comparison ──────────────────────────────────────────────────────
-    print(f"\n{'='*55}")
+    # ── Append to team-wide test_metrics.csv (creates if absent) ─────────────
+    team_csv = TABLES_DIR / "test_metrics.csv"
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    if team_csv.exists():
+        existing = pd.read_csv(team_csv)
+        # Drop any previous M4 rows so we don't accumulate duplicates
+        existing = existing[
+            ~((existing["member"] == "M4") & (existing["architecture"].isin(df["architecture"].tolist())))
+        ]
+        combined = pd.concat([existing, df], ignore_index=True)
+    else:
+        combined = df
+    combined.to_csv(team_csv, index=False)
+    print(f"Appended: {team_csv}  ← xai_analysis.py is now unlocked")
+
+    # ── Comparison printout ───────────────────────────────────────────────────
+    print(f"\n{'='*60}")
     print("  M4 TEST RESULTS — Architecture Comparison")
-    print(f"{'='*55}")
-    print(df_full[["Architecture", "Dice_WT", "IoU_WT", "HD95_WT"]].to_string(index=False))
+    print(f"{'='*60}")
+    cols = ["architecture", "dice_wt", "dice_tc", "dice_et", "hd95_wt"]
+    print(df[cols].to_string(index=False))
 
     if len(rows) > 1:
-        winner = df_full.loc[df_full["Dice_WT"].idxmax(), "Architecture"]
-        print(f"\n  ✓ Best for T2f: {winner}")
-
-    # ── Create test_metrics.csv so xai_analysis.py can run ───────────────────
-    df_full.to_csv(TABLES_DIR / "test_metrics.csv", index=False)
-    print(f"\ntest_metrics.csv written → xai_analysis.py is now unlocked")
+        best_arch = df.loc[df["dice_wt"].idxmax(), "architecture"]
+        print(f"\n  ✓ Best for T2f FLAIR: {best_arch}")
+        print(f"    Use this checkpoint for extract_features.py")
 
 
 if __name__ == "__main__":
