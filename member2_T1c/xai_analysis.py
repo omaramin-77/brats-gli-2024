@@ -41,7 +41,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
+import argparse
+from shared.config import PATCH_SIZE
 from shared.config import (
     CHECKPOINT_DIR,
     FIGURES_DIR,
@@ -62,8 +63,8 @@ MODALITY = "t1c"
 N_PATIENTS = 3
 TARGET_LAYER_NAME = "enc4"          # last encoder ConvBlock3D
 OCCLUSION_WINDOW = 8
-OCCLUSION_STRIDE = 4
-OCCLUSION_BATCH = 8
+OCCLUSION_STRIDE = 8
+OCCLUSION_BATCH = 1
 SUBREGIONS = ("wt", "tc", "et")
 CHANNEL_INDEX = {"wt": 0, "tc": 1, "et": 2}
 
@@ -146,8 +147,10 @@ def _occlusion_sensitivity(model, x, device, pid, vol, subregion_gts):
     # Baseline mean predicted probability per channel.
     with torch.no_grad():
         baseline_logits = model(x)
-        baseline_probs = torch.sigmoid(baseline_logits)        # (1, 3, D, H, W)
-        baseline_mean = baseline_probs.mean(dim=(2, 3, 4))     # (1, 3)
+        baseline_probs = torch.sigmoid(baseline_logits)
+        baseline_mean = baseline_probs.mean(dim=(2, 3, 4)).clone()  # (1, 3)
+    del baseline_logits, baseline_probs
+    torch.cuda.empty_cache()
 
     # Grid of valid window starts on each axis.
     starts_d = list(range(0, D - w + 1, s))
@@ -209,6 +212,11 @@ def _occlusion_sensitivity(model, x, device, pid, vol, subregion_gts):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["full", "patch"], default="full")
+    args = parser.parse_args()
+    PATCH_SIDE = PATCH_SIZE[0] if isinstance(PATCH_SIZE, tuple) else PATCH_SIZE
+
     # ── test-set contamination guard (claude.md §4) ──────────────────────────
     # XAI runs on test patients; the test split must never be examined before
     # evaluate.py has produced its results row. Run from main() rather than
@@ -261,6 +269,30 @@ def main() -> None:
         tc_gt = ((seg == 1) | (seg == 3)).astype(np.uint8)
         et_gt = (seg == 3).astype(np.uint8)
         subregion_gts = {"wt": wt_gt, "tc": tc_gt, "et": et_gt}
+
+        if args.mode == "patch":
+            # Centre a PATCH_SIDE**3 cube on the WT centroid so XAI runs
+            # at the same resolution the model was trained on — much cheaper
+            # than running on the full 128**3 volume, especially for the
+            # occlusion-sensitivity pass.
+            if wt_gt.sum() > 0:
+                centre = np.argwhere(wt_gt > 0).mean(axis=0).astype(int)
+            else:
+                centre = np.array(wt_gt.shape) // 2
+            half = PATCH_SIDE // 2
+            centre = np.clip(centre, half, np.array(wt_gt.shape) - half)
+            s = tuple(slice(int(c - half), int(c + half)) for c in centre)
+
+            # Replace vol, seg, sub-region GTs with their patched versions.
+            vol = vol[(slice(None),) + s]                        # (1, P, P, P)
+            seg = seg[s]                                          # (P, P, P)
+            wt_gt = ((seg == 1) | (seg == 2) | (seg == 3)).astype(np.uint8)
+            tc_gt = ((seg == 1) | (seg == 3)).astype(np.uint8)
+            et_gt = (seg == 3).astype(np.uint8)
+            subregion_gts = {"wt": wt_gt, "tc": tc_gt, "et": et_gt}
+
+            x = torch.from_numpy(vol).float().unsqueeze(0).to(device)
+            print(f"[xai] patch mode: centred at {tuple(centre)}, shape {tuple(vol.shape)}")
 
         _gradcam_pass(model, target_layer, x, vol, subregion_gts, pid)
 
