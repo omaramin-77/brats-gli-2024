@@ -30,6 +30,17 @@ import argparse  # noqa: E402
 
 import torch  # noqa: E402
 
+# tqdm gives batch-level progress visibility. With ~1100 batches/epoch on M2
+# the per-epoch print otherwise leaves ~15-20 min of silence between
+# "Epoch N starting..." and the train_loss line. Falls back to a no-op
+# wrapper if tqdm is not installed so training never fails on a missing
+# progress library.
+try:
+    from tqdm import tqdm  # noqa: E402
+except ImportError:                                                # pragma: no cover
+    def tqdm(iterable=None, **_kwargs):                            # type: ignore[no-redef]
+        return iterable
+
 from shared.config import (  # noqa: E402
     AMP_ENABLED,
     BATCH_SIZE,
@@ -181,8 +192,14 @@ def main() -> None:
     try:
         for epoch in range(1, NUM_EPOCHS + 1):
             print(f"Epoch {epoch} starting...")
+            train_bar = tqdm(
+                train_loader,
+                desc=f"epoch {epoch:03d}/{NUM_EPOCHS} train",
+                leave=False,
+                dynamic_ncols=True,
+            )
             train_metrics = train_one_epoch(
-                model, train_loader, optimizer, scaler, device, loss_fn
+                model, train_bar, optimizer, scaler, device, loss_fn
             )
             print(f"[epoch {epoch:03d}] train_loss={train_metrics['loss']:.4f}")
             history["train_loss"].append(train_metrics["loss"])
@@ -198,8 +215,14 @@ def main() -> None:
             # when NUM_EPOCHS is not a multiple of VAL_EVERY_N_EPOCHS, so
             # EarlyStopper and CheckpointManager operate on stale numbers.
             if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == NUM_EPOCHS:
+                val_bar = tqdm(
+                    val_loader,
+                    desc=f"epoch {epoch:03d}/{NUM_EPOCHS} val",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
                 val_metrics = validate_one_epoch(
-                    model, val_loader, device, loss_fn
+                    model, val_bar, device, loss_fn
                 )
                 print(
                     f"[epoch {epoch:03d}] val_loss={val_metrics.get('loss', 0.0):.4f} "
