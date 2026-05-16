@@ -1,0 +1,2 @@
+member,modality,architecture,dice_wt,iou_wt,hd95_wt,dice_tc,iou_tc,hd95_tc,dice_et,iou_et,hd95_et
+M4,T2f (FLAIR),ResUNet3D,0.7933,0.6864,7.8661,0.3227,0.2789,22.055,0.3076,0.2658,21.5791
