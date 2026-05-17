@@ -1,1 +1,1 @@
-C:\Users\Wesoo\Desktop\Junior - Spring\ANN\ANN\BraTS2024-BraTS-GLI-TrainingData\training_data1_v2
+D:\ANN_project\data\raw\BraTS2024-BraTS-GLI-TrainingData\training_data1_v2

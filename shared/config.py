@@ -47,10 +47,10 @@ DATA_PATH_FILE = REPO_ROOT / "data" / "raw" / "DATA_PATH.txt"
 DATA_PATH_LOCAL_FILE = REPO_ROOT / "data" / "raw" / "DATA_PATH.local.txt"
 
 # Output Dirs (Member 4 T2f Specific)
-CHECKPOINT_DIR = RESULTS_DIR / "T2F/checkpoints"
-FIGURES_DIR    = RESULTS_DIR / "T2F/figures"
-TABLES_DIR     = RESULTS_DIR / "T2F/tables"
-FEATURE_DIR    = RESULTS_DIR / "T2F/features"  # Added for Fusion Strategy
+CHECKPOINT_DIR = RESULTS_DIR / "/checkpoints"
+FIGURES_DIR    = RESULTS_DIR / "/figures"
+TABLES_DIR     = RESULTS_DIR / "/tables"
+FEATURE_DIR    = RESULTS_DIR / "/features"  # Added for Fusion Strategy
 MLRUNS_DIR     = RESULTS_DIR / "mlruns"
 
 # Ensure output directories exist (required for Kaggle /working space)
