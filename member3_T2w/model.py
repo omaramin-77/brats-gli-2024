@@ -79,7 +79,11 @@ class M3T2wSwinUNETR(nn.Module):
     def get_target_layer(self) -> nn.Module:
         """
         Target layer for Grad-CAM.
+        decoder2 outputs at 32³ resolution — precise enough for tumour localisation
+        without the 4³ coarseness of decoder5 (which maps each point to a 16³ cube).
         """
+        if hasattr(self.model, "decoder2"):
+            return self.model.decoder2
         if hasattr(self.model, "decoder5"):
             return self.model.decoder5
         if hasattr(self.model, "encoder10"):
