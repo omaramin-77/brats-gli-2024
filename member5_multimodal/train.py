@@ -83,7 +83,7 @@ def main() -> None:
         split_file=str(SPLITS_DIR / "val_ids.txt"),
         modality=MODALITY,
         augment=False,
-        full_volume=True,                  # full-volume eval, SWI tiles internally
+        full_volume=True,                  
     )
 
     train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=6)
