@@ -10,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from monai.networks.nets import SwinUNETR
 
 from shared.config import TARGET_CHANNELS
@@ -62,6 +63,15 @@ class M3T2wSwinUNETR(nn.Module):
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """
         Extract Swin bottleneck features for M5 latent fusion.
+
+        Contract (design.md §9.2): returns (B, 256, H/16, W/16, D/16).
+        SwinUNETR's natural deepest hidden state is at H/32 because of
+        patch_embed(×2) + 4 PatchMerging stages(×2 each). We project that
+        4³ feature (for 128³ input) with the trained 384→256 projector,
+        then trilinearly upsample to the contracted H/16 spatial size.
+        Using the deepest hidden state preserves what the trained model
+        learned; only the spatial resolution is reconciled to the LFH
+        contract shared with M1/M2/M4.
         """
         try:
             hidden_states = self.model.swinViT(x, self.model.normalize)
@@ -74,7 +84,17 @@ class M3T2wSwinUNETR(nn.Module):
         if bottleneck.shape[1] != self.feature_size * 16:
             bottleneck = bottleneck.permute(0, 4, 1, 2, 3).contiguous()
 
-        return self.feature_projector(bottleneck)
+        projected = self.feature_projector(bottleneck)  # (B, 256, H/32, ...)
+
+        target_spatial = tuple(s // 16 for s in x.shape[2:])
+        if tuple(projected.shape[2:]) != target_spatial:
+            projected = F.interpolate(
+                projected,
+                size=target_spatial,
+                mode="trilinear",
+                align_corners=False,
+            )
+        return projected
 
     def get_target_layer(self) -> nn.Module:
         """
@@ -115,5 +135,10 @@ if __name__ == "__main__":
 
     assert tuple(y.shape) == (1, 3, 64, 64, 64), f"Wrong output shape: {y.shape}"
     assert f.shape[1] == 256, f"Wrong feature channels: {f.shape}"
+    # Honor the LFH /16 contract: bottleneck spatial = input_spatial / 16.
+    expected_spatial = tuple(s // 16 for s in x.shape[2:])
+    assert tuple(f.shape[2:]) == expected_spatial, (
+        f"forward_features spatial {tuple(f.shape[2:])} != expected {expected_spatial}"
+    )
 
     print("Smoke-test PASSED")
