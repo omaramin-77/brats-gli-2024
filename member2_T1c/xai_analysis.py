@@ -58,7 +58,7 @@ from shared.preprocessing import preprocess_patient
 from member2_T1c.model import AttentionUNet3D
 
 
-MEMBER_NAME = "M2_T1c_AttUNet"
+MEMBER_NAME = "M2_T1c_AttUNet_focal"
 MODALITY = "t1c"
 N_PATIENTS = 3
 TARGET_LAYER_NAME = "enc4"          # last encoder ConvBlock3D
