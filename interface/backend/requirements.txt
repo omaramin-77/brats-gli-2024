@@ -1,0 +1,11 @@
+# FastAPI backend for the BraTS GLI-2024 demo.
+# Repo root requirements.txt already lists torch / monai / nibabel etc. — install that first.
+# These are the extras the web layer needs.
+
+fastapi~=0.115
+uvicorn[standard]~=0.30
+python-multipart~=0.0.9
+pydantic~=2.8
+pillow~=10.4
+reportlab~=4.2
+aiofiles~=24.1
