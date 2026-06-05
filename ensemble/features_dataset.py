@@ -104,7 +104,12 @@ class FeaturesDataset(Dataset):
         "t2w": "M3_T2w",
     }
 
-    def __init__(self, split_file: str, data_root: str | None = None):
+    def __init__(
+        self,
+        split_file: str,
+        data_root: str | None = None,
+        modalities: tuple[str, ...] = ("t1c", "t1n", "t2f", "t2w"),
+    ):
         path = Path(split_file)
         if not path.exists():
             raise FileNotFoundError(f"split file not found: {path}")
@@ -113,58 +118,77 @@ class FeaturesDataset(Dataset):
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        unknown = [m for m in modalities if m not in self.FEATURE_DIRS]
+        if unknown:
+            raise ValueError(
+                f"Unknown modalities {unknown}; must be subset of "
+                f"{tuple(self.FEATURE_DIRS.keys())}"
+            )
+        self.modalities = tuple(modalities)
         self.data_root = Path(data_root) if data_root else Path(get_data_root())
         # NOTE: derive from RESULTS_DIR rather than shared.config.FEATURE_DIR
         # because config.FEATURE_DIR is broken on Windows (resolves to D:/features).
         self.features_root = RESULTS_DIR / "features"
 
-        # Pre-flight check: every patient must have all 4 feature files.
+        # Pre-flight check: every patient must have all features for the
+        # requested modality subset, plus a coordinate-frame-aligned label.
         missing = []
         for pid in self.patient_ids:
-            for mod, dirname in self.FEATURE_DIRS.items():
+            for mod in self.modalities:
+                dirname = self.FEATURE_DIRS[mod]
                 fpath = self.features_root / dirname / f"{pid}.pt"
                 if not fpath.exists():
                     missing.append(str(fpath))
+            label_path = RESULTS_DIR / "predictions" / "labels" / f"{pid}.pt"
+            if not label_path.exists():
+                missing.append(str(label_path))
         if missing:
             raise FileNotFoundError(
-                f"FeaturesDataset: {len(missing)} feature files missing. "
-                f"First missing: {missing[0]}"
+                f"FeaturesDataset: {len(missing)} files missing. "
+                f"First missing: {missing[0]}.\n"
+                "If predictions are present but labels are not, run "
+                "`python LateEnsemble/cache_predictions.py --labels-only`."
             )
 
     def __len__(self) -> int:
         return len(self.patient_ids)
 
     def _load_label(self, patient_id: str) -> torch.Tensor:
-        """Load the (3, 128, 128, 128) WT/TC/ET target.
+        """Load the (3, 128, 128, 128) WT/TC/ET target — coordinate-frame aligned.
 
-        Reads from the on-disk cache produced by ensemble/cache_labels.py
-        if present. Falls back to live NIfTI loading + resize otherwise,
-        so the dataset stays functional when the cache has not been
-        built yet (e.g. in CI smoke tests).
+        Reads from ``results/predictions/labels/{pid}.pt`` first. That cache
+        is built by ``LateEnsemble/cache_predictions.py`` from BraTSDataset's
+        full_volume output, so the label lives in the SAME brain-cropped
+        128³ frame as every member's features (which all go through
+        preprocess_patient before extraction).
 
-        The cache stores uint8 for compactness; we cast to float here
-        because BCE / Dice expect float targets.
+        The older ``results/features/labels/`` cache built by the local
+        ``ensemble/cache_labels.py`` is in a different coordinate frame
+        (raw-resize, no brain crop). label/pred IoU drops to ~0.06 on
+        TC/ET under that mismatch. We deliberately do NOT fall back to it.
+        See CLAUDE.md §2.13.
+
+        The aligned cache stores uint8 for compactness; we cast to float
+        here because BCE / Dice expect float targets.
         """
-        cache_path = self.features_root / "labels" / f"{patient_id}.pt"
-        if cache_path.exists():
-            return torch.load(cache_path, map_location="cpu").float()
+        aligned = RESULTS_DIR / "predictions" / "labels" / f"{patient_id}.pt"
+        if aligned.exists():
+            return torch.load(aligned, map_location="cpu").float()
 
-        # Fallback: rebuild from NIfTI. Identical to the original logic.
-        pdir = self.data_root / patient_id
-        seg_path = next(pdir.glob("*seg*.nii*"))
-        seg_raw = nib.load(str(seg_path)).get_fdata().astype(np.int16)
-        seg = resize_volume(seg_raw, (128, 128, 128), order=0).astype(np.int16)
-        wt = ((seg == 1) | (seg == 2) | (seg == 3))
-        tc = ((seg == 1) | (seg == 3))
-        et = (seg == 3)
-        return torch.from_numpy(
-            np.stack([wt, tc, et], axis=0).astype(np.float32)
+        # No aligned cache and no fallback that would silently train on
+        # broken data. Raise loudly with the fix instructions.
+        raise FileNotFoundError(
+            f"Aligned label for {patient_id} not found at {aligned}.\n"
+            "Run `python LateEnsemble/cache_predictions.py --labels-only` "
+            "to populate it. (Do NOT use ensemble/cache_labels.py — its "
+            "labels are in the wrong coordinate frame; see CLAUDE.md §2.13.)"
         )
 
     def __getitem__(self, idx: int) -> dict:
         pid = self.patient_ids[idx]
         features = {}
-        for mod, dirname in self.FEATURE_DIRS.items():
+        for mod in self.modalities:
+            dirname = self.FEATURE_DIRS[mod]
             fpath = self.features_root / dirname / f"{pid}.pt"
             t = torch.load(fpath, map_location="cpu")
             features[mod] = _normalise_feature_shape(t, mod, pid)

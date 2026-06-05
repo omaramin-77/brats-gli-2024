@@ -49,20 +49,37 @@ from shared.trainer import CheckpointManager, EarlyStopper, dice_bce_loss  # noq
 from shared.visualization import plot_training_curves  # noqa: E402
 
 from ensemble.features_dataset import FeaturesDataset  # noqa: E402
-from ensemble.fusion import LatentFusionEnsemble, build_gate_bias  # noqa: E402
+from ensemble.fusion import ALL_MODALITIES, LatentFusionEnsemble, build_gate_bias  # noqa: E402
 
 
-MEMBER_NAME = "M5_LatentFusion_XAI"
-MLFLOW_RUN_NAME = "M5-fusion-XAI-initialised-seed42"
+# Base member name; the actual on-disk checkpoint name is suffixed with the
+# modality count so 3-modality and 4-modality runs do not overwrite each other.
+BASE_MEMBER_NAME = "M5_LatentFusion_XAI"
 # Fusion-specific hyperparameters (override config defaults).
-FUSION_NUM_EPOCHS = 30
-FUSION_BATCH_SIZE = 4   # features are small; larger batch fits comfortably
+FUSION_NUM_EPOCHS = 60     # bumped from 30 — small head with cold-start decoder needs more time
+FUSION_BATCH_SIZE = 4
 FUSION_LR = 3e-4
+FUSION_WARMUP_EPOCHS = 5   # linear LR warmup 0 -> FUSION_LR over first 5 epochs
 
 # Correct path overrides — see module docstring.
 CHECKPOINT_DIR = RESULTS_DIR / "checkpoints"
 FIGURES_DIR    = RESULTS_DIR / "figures"
 TABLES_DIR     = RESULTS_DIR / "tables"
+
+
+def _member_name_for(modalities: tuple[str, ...]) -> str:
+    """Distinct checkpoint name per modality subset."""
+    if len(modalities) == len(ALL_MODALITIES):
+        return BASE_MEMBER_NAME
+    short = "".join(m for m in modalities)
+    return f"{BASE_MEMBER_NAME}_only_{short}"
+
+
+def _mlflow_run_name_for(modalities: tuple[str, ...]) -> str:
+    if len(modalities) == len(ALL_MODALITIES):
+        return "M5-fusion-XAI-initialised-seed42"
+    short = "-".join(modalities)
+    return f"M5-fusion-XAI-{short}-seed42"
 
 
 def train_one_fusion_epoch(model, loader, optimizer, scaler, device, loss_fn):
@@ -117,15 +134,62 @@ def validate_one_fusion_epoch(model, loader, device, loss_fn):
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Train the Latent Space Fusion Head (Pipeline C)."
+    )
+    parser.add_argument(
+        "--modalities", nargs="+", default=list(ALL_MODALITIES),
+        choices=list(ALL_MODALITIES),
+        help="Modality subset to fuse. Default = all 4. Pass e.g. "
+             "'--modalities t1c t1n t2f' to drop t2w (or any 3-modality "
+             "ablation). The model architecture, checkpoint name, and "
+             "MLflow run name all adapt automatically.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=FUSION_NUM_EPOCHS,
+        help=f"Total epochs (default: {FUSION_NUM_EPOCHS}).",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=FUSION_WARMUP_EPOCHS,
+        help=f"Linear LR warmup epochs from 0 to lr (default: {FUSION_WARMUP_EPOCHS}).",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=FUSION_LR,
+        help=f"Peak LR after warmup (default: {FUSION_LR}).",
+    )
+    parser.add_argument(
+        "--no-normalise", action="store_true",
+        help="Ablation flag: disable per-modality input normalisation "
+             "(forces the attention conv to learn across raw, statistically "
+             "incompatible bottleneck distributions). Default is to normalise.",
+    )
+    args = parser.parse_args()
+
+    # Preserve canonical modality order (matches ALL_MODALITIES) so weight
+    # columns line up across runs even if the user passes modalities in
+    # arbitrary order on the command line.
+    modalities = tuple(m for m in ALL_MODALITIES if m in args.modalities)
+    member_name = _member_name_for(modalities)
+    mlflow_run_name = _mlflow_run_name_for(modalities)
+    num_epochs = int(args.epochs)
+    warmup_epochs = max(0, int(args.warmup))
+    peak_lr = float(args.lr)
+    normalise_inputs = not args.no_normalise
+
     train_start = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     print(f"[fusion] device: {device}")
+    print(f"[fusion] modalities: {modalities}  ({len(modalities)}-modality run)")
+    print(f"[fusion] checkpoint name: {member_name}")
+    print(f"[fusion] normalise inputs: {normalise_inputs}")
+    print(f"[fusion] epochs={num_epochs} warmup={warmup_epochs} peak_lr={peak_lr}")
 
-    train_ds = FeaturesDataset(str(SPLITS_DIR / "train_ids.txt"))
-    val_ds = FeaturesDataset(str(SPLITS_DIR / "val_ids.txt"))
+    train_ds = FeaturesDataset(str(SPLITS_DIR / "train_ids.txt"), modalities=modalities)
+    val_ds = FeaturesDataset(str(SPLITS_DIR / "val_ids.txt"), modalities=modalities)
     print(f"[fusion] train patients: {len(train_ds)}  val patients: {len(val_ds)}")
 
     pin = device.type == "cuda"
@@ -146,19 +210,42 @@ def main() -> None:
             f"modality_importance_scores.json not found at {bias_path}. "
             "Run python member5_multimodal/ablation.py first."
         )
-    gate_bias = build_gate_bias(bias_path)
+    gate_bias = build_gate_bias(bias_path, modalities=modalities)
     print(f"[fusion] gate bias (init): {gate_bias.tolist()}")
     print(f"[fusion] attention prior:   {torch.softmax(gate_bias, dim=0).tolist()}")
-    print("[fusion] modality order:    (t1c, t1n, t2f, t2w)")
+    print(f"[fusion] modality order:    {modalities}")
 
-    model = LatentFusionEnsemble(gate_bias_init=gate_bias).to(device)
+    model = LatentFusionEnsemble(
+        gate_bias_init=gate_bias,
+        modalities=modalities,
+        normalise_inputs=normalise_inputs,
+    ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[fusion] parameters: {total_params:,}")
 
+    # AdamW is built at peak LR; we manually scale the LR per epoch during the
+    # warmup window, then hand control to CosineAnnealingLR for the remaining
+    # epochs. Cosine T_max is total_epochs - warmup so the cosine cycle ends
+    # at the last epoch regardless of warmup length.
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=FUSION_LR, weight_decay=WEIGHT_DECAY
+        model.parameters(), lr=peak_lr, weight_decay=WEIGHT_DECAY
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=FUSION_NUM_EPOCHS)
+    cosine_t_max = max(1, num_epochs - warmup_epochs)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cosine_t_max)
+
+    def apply_warmup_lr(epoch_one_indexed: int) -> float:
+        """Linear warmup from 0 -> peak_lr over warmup_epochs.
+
+        Returns the LR actually set so it can be logged. Called BEFORE the
+        epoch runs; cosine.step() is called AFTER the epoch finishes once
+        warmup is over.
+        """
+        if warmup_epochs == 0 or epoch_one_indexed > warmup_epochs:
+            return optimizer.param_groups[0]["lr"]
+        scaled = peak_lr * (epoch_one_indexed / warmup_epochs)
+        for group in optimizer.param_groups:
+            group["lr"] = scaled
+        return scaled
     scaler = (
         torch.amp.GradScaler("cuda")
         if (AMP_ENABLED and device.type == "cuda")
@@ -166,28 +253,31 @@ def main() -> None:
     )
 
     stopper = EarlyStopper(patience=15)
-    ckpt = CheckpointManager(save_dir=str(CHECKPOINT_DIR), member_name=MEMBER_NAME)
+    ckpt = CheckpointManager(save_dir=str(CHECKPOINT_DIR), member_name=member_name)
 
     # MLflow lazy import — fusion runs even if mlflow isn't installed.
     try:
         import mlflow  # type: ignore
         mlflow.set_tracking_uri(MLRUNS_DIR.as_uri())
-        mlflow.set_experiment(MEMBER_NAME)
-        mlflow_run = mlflow.start_run(run_name=MLFLOW_RUN_NAME)
+        mlflow.set_experiment(member_name)
+        mlflow_run = mlflow.start_run(run_name=mlflow_run_name)
     except ImportError:
         mlflow = None
         mlflow_run = None
 
     if mlflow is not None:
-        mlflow.log_param("member",        MEMBER_NAME)
+        mlflow.log_param("member",        member_name)
         mlflow.log_param("architecture",  "LatentFusionEnsemble")
         mlflow.log_param("seed",          GLOBAL_SEED)
         mlflow.log_param("batch_size",    FUSION_BATCH_SIZE)
-        mlflow.log_param("lr",            FUSION_LR)
+        mlflow.log_param("peak_lr",       peak_lr)
+        mlflow.log_param("warmup_epochs", warmup_epochs)
         mlflow.log_param("weight_decay",  WEIGHT_DECAY)
-        mlflow.log_param("num_epochs",    FUSION_NUM_EPOCHS)
+        mlflow.log_param("num_epochs",    num_epochs)
         mlflow.log_param("amp",           AMP_ENABLED)
-        for i, mod in enumerate(("t1c", "t1n", "t2f", "t2w")):
+        mlflow.log_param("modalities",    ",".join(modalities))
+        mlflow.log_param("normalise_inputs", normalise_inputs)
+        for i, mod in enumerate(modalities):
             mlflow.log_param(f"gate_bias_{mod}", float(gate_bias[i].item()))
 
     print("[fusion] starting training...")
@@ -195,8 +285,11 @@ def main() -> None:
     best_dice = -1.0
 
     try:
-        for epoch in range(1, FUSION_NUM_EPOCHS + 1):
-            print(f"[fusion] epoch {epoch} starting...")
+        for epoch in range(1, num_epochs + 1):
+            # Set LR via linear warmup for the first `warmup_epochs`; afterwards
+            # the cosine scheduler steps at the end of the epoch.
+            current_lr = apply_warmup_lr(epoch)
+            print(f"[fusion] epoch {epoch} starting (lr={current_lr:.6f})...")
             train_metrics = train_one_fusion_epoch(
                 model, train_loader, optimizer, scaler, device, dice_bce_loss
             )
@@ -205,13 +298,16 @@ def main() -> None:
             if mlflow is not None:
                 mlflow.log_metric("train_loss", train_metrics["loss"], step=epoch)
 
-            scheduler.step()
+            # Only step the cosine scheduler once warmup has completed,
+            # otherwise the cosine cycle starts before warmup is over.
+            if epoch > warmup_epochs:
+                scheduler.step()
             if mlflow is not None:
                 mlflow.log_metric("lr", optimizer.param_groups[0]["lr"], step=epoch)
 
-            # The `or epoch == FUSION_NUM_EPOCHS` guarantees a final validation
-            # when FUSION_NUM_EPOCHS is not a multiple of VAL_EVERY_N_EPOCHS.
-            if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == FUSION_NUM_EPOCHS:
+            # The `or epoch == num_epochs` guarantees a final validation
+            # when num_epochs is not a multiple of VAL_EVERY_N_EPOCHS.
+            if epoch % VAL_EVERY_N_EPOCHS == 0 or epoch == num_epochs:
                 val_metrics = validate_one_fusion_epoch(
                     model, val_loader, device, dice_bce_loss
                 )
@@ -256,17 +352,22 @@ def main() -> None:
 
         # Sidecar JSON so evaluate_fusion.py can read training metadata.
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        sidecar = CHECKPOINT_DIR / f"{MEMBER_NAME}_train_meta.json"
+        sidecar = CHECKPOINT_DIR / f"{member_name}_train_meta.json"
         sidecar.write_text(json.dumps({
             "training_time_hrs": training_time_hrs,
             "gpu_memory_gb":     gpu_memory_gb,
             "gate_bias_init":    gate_bias.tolist(),
+            "modalities":        list(modalities),
+            "normalise_inputs":  normalise_inputs,
+            "warmup_epochs":     warmup_epochs,
+            "peak_lr":           peak_lr,
+            "num_epochs":        num_epochs,
         }, indent=2), encoding="utf-8")
 
         # Save training curves figure.
         FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-        curves_path = FIGURES_DIR / f"training_curves_{MEMBER_NAME}.png"
-        plot_training_curves(dict(history), MEMBER_NAME, save_path=str(curves_path))
+        curves_path = FIGURES_DIR / f"training_curves_{member_name}.png"
+        plot_training_curves(dict(history), member_name, save_path=str(curves_path))
         print(f"[fusion] saved training curves to {curves_path}")
         if mlflow is not None:
             mlflow.log_artifact(str(curves_path))

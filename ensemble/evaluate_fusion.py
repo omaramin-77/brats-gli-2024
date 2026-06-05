@@ -37,11 +37,10 @@ from shared.config import (  # noqa: E402
 from shared.trainer import CheckpointManager, dice_bce_loss  # noqa: E402
 
 from ensemble.features_dataset import FeaturesDataset  # noqa: E402
-from ensemble.fusion import LatentFusionEnsemble, build_gate_bias  # noqa: E402
-from ensemble.train_fusion import validate_one_fusion_epoch  # noqa: E402
+from ensemble.fusion import ALL_MODALITIES, LatentFusionEnsemble, build_gate_bias  # noqa: E402
+from ensemble.train_fusion import _member_name_for, validate_one_fusion_epoch  # noqa: E402
 
 
-MEMBER_NAME = "M5_LatentFusion_XAI"
 MODALITY = "multimodal-features"
 ARCHITECTURE = "LatentFusionEnsemble"
 BASELINE_MEMBER_NAME = "M5_Multimodal_4ch"
@@ -72,34 +71,60 @@ def _read_baseline_row(csv_path: Path) -> dict | None:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Evaluate the trained Latent Space Fusion Head on the test split."
+    )
+    parser.add_argument(
+        "--modalities", nargs="+", default=list(ALL_MODALITIES),
+        choices=list(ALL_MODALITIES),
+        help="Modality subset used at train time. Must match the train run "
+             "you are evaluating (the checkpoint name is suffix-encoded by "
+             "modality count).",
+    )
+    args = parser.parse_args()
+
+    modalities = tuple(m for m in ALL_MODALITIES if m in args.modalities)
+    member_name = _member_name_for(modalities)
+    print(f"[eval-fusion] modalities: {modalities}")
+    print(f"[eval-fusion] checkpoint name: {member_name}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[eval-fusion] device: {device}")
 
-    test_ds = FeaturesDataset(str(SPLITS_DIR / "test_ids.txt"))
+    test_ds = FeaturesDataset(str(SPLITS_DIR / "test_ids.txt"), modalities=modalities)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
     print(f"[eval-fusion] test patients: {len(test_ds)}")
 
     # gate_bias is needed only for instantiation; the trained checkpoint
     # overwrites the conv bias when loaded.
     bias_path = TABLES_DIR / "modality_importance_scores.json"
-    gate_bias = build_gate_bias(bias_path)
-    model = LatentFusionEnsemble(gate_bias_init=gate_bias).to(device)
+    gate_bias = build_gate_bias(bias_path, modalities=modalities)
 
-    ckpt = CheckpointManager(CHECKPOINT_DIR, MEMBER_NAME)
+    # If the sidecar exists, replay the same normalisation flag the model
+    # was trained with so loading the checkpoint succeeds.
+    sidecar_path = CHECKPOINT_DIR / f"{member_name}_train_meta.json"
+    if sidecar_path.exists():
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    else:
+        sidecar = {"training_time_hrs": float("nan"), "gpu_memory_gb": float("nan")}
+    normalise_inputs = bool(sidecar.get("normalise_inputs", True))
+
+    model = LatentFusionEnsemble(
+        gate_bias_init=gate_bias,
+        modalities=modalities,
+        normalise_inputs=normalise_inputs,
+    ).to(device)
+
+    ckpt = CheckpointManager(CHECKPOINT_DIR, member_name)
     model, _, epoch, val_dice = ckpt.load_best(model)
     model = model.to(device)
     print(f"[eval-fusion] loaded best checkpoint @ epoch {epoch} (val_dice_wt={val_dice:.4f})")
 
     metrics = validate_one_fusion_epoch(model, test_loader, device, dice_bce_loss)
 
-    sidecar_path = CHECKPOINT_DIR / f"{MEMBER_NAME}_train_meta.json"
-    if sidecar_path.exists():
-        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    else:
-        sidecar = {"training_time_hrs": float("nan"), "gpu_memory_gb": float("nan")}
-
     row = {
-        "member": MEMBER_NAME,
+        "member": member_name,
         "modality": MODALITY,
         "architecture": ARCHITECTURE,
         "seed": GLOBAL_SEED,
@@ -131,7 +156,7 @@ def main() -> None:
     print("=" * 60)
     print("LATENT FUSION ENSEMBLE — TEST RESULTS")
     print("=" * 60)
-    print(f"  member           : {MEMBER_NAME}")
+    print(f"  member           : {member_name}")
     print(f"  architecture     : {ARCHITECTURE}")
     print(f"  Dice_WT          : {row['dice_wt']:.4f}")
     print(f"  Dice_TC          : {row['dice_tc']:.4f}")
