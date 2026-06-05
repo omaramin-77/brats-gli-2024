@@ -14,13 +14,14 @@ the modality.
 ```
 brats-gli-2024/
 ├── shared/                # preprocessing, dataset, metrics, Grad-CAM, viz, config
-├── member1_T1n/           # Member 1 — T1n native pipeline
-├── member2_T1c/           # Member 2 — T1c contrast-enhanced pipeline
-├── member3_T2w/           # Member 3 — T2w pipeline
-├── member4_T2f/           # Member 4 — T2-FLAIR pipeline
-├── member5_multimodal/    # Member 5 — stacked 4-channel multimodal pipeline
-├── ensemble/              # late-fusion / averaging across members
-├── interface/             # Streamlit demo (Phase 4)
+├── member1_T1n/           # Member 1 — T1n native pipeline (3D Residual U-Net + deep supervision)
+├── member2_T1c/           # Member 2 — T1c contrast-enhanced pipeline (Attention-Gated U-Net)
+├── member3_T2w/           # Member 3 — T2w pipeline (MONAI Swin-UNETR)
+├── member4_T2f/           # Member 4 — T2-FLAIR pipeline (ResUNet + SegResNet) + Gradio demo
+├── member5_multimodal/    # Member 5 — naive 4-channel multimodal baseline + ablation
+├── ensemble/              # Pipeline C — Latent Space Fusion Head (built; underperformed naive M5)
+├── LateEnsemble/          # Pipeline D — XAI-weighted late fusion stacker (current direction)
+├── interface/             # Streamlit demo placeholder (member4 ships a working Gradio app)
 ├── data/
 │   ├── raw/               # absolute path to BraTS root in DATA_PATH.txt
 │   ├── processed/         # cached preprocessed volumes (gitignored)
@@ -28,9 +29,14 @@ brats-gli-2024/
 ├── experiments/mlruns/    # MLflow tracking (gitignored)
 └── results/
     ├── figures/           # PNGs for the report and slides
-    ├── tables/            # CSV metric exports
-    └── checkpoints/       # .pt files (gitignored)
+    ├── tables/            # CSV metric exports (test_metrics.csv is the headline)
+    ├── checkpoints/       # .pt files (gitignored)
+    ├── features/          # per-modality bottleneck tensors for Pipeline C (gitignored)
+    └── predictions/       # per-member full-volume logits + aligned labels for Pipeline D (gitignored)
 ```
+
+Project status: see `.claude/STATUS.md` for the current state of each phase
+and what's left for the write-up.
 
 ## Setup
 
@@ -100,7 +106,7 @@ from shared.dataset import BraTSDataset, get_dataloader, load_splits
 * `data/raw/DATA_PATH.txt` points to the dataset on disk — keep its target
   read-only.
 
-## Weekly milestones
+## Weekly milestones (original schedule, kept for reference)
 
 | Week | Phase                          | Owner       | Deliverable                                            |
 |------|--------------------------------|-------------|--------------------------------------------------------|
@@ -110,3 +116,8 @@ from shared.dataset import BraTSDataset, get_dataloader, load_splits
 | 4    | Phase 3 — XAI                  | All         | Grad-CAM overlays for every member, qualitative figures|
 | 5    | Phase 4 — ensemble + UI        | M5 + lead   | late-fusion ensemble + Streamlit demo                  |
 | 6    | Report + slides                | All         | written report, final figures and tables               |
+
+Phases 0–3 are complete. Phase 4 produced Pipeline C (latent fusion, in
+`ensemble/`) which empirically underperformed; Pipeline D (XAI-weighted
+late fusion, in `LateEnsemble/`) is the current attempt. See
+`.claude/STATUS.md` for current numbers and outstanding work.

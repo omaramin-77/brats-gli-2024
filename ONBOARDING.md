@@ -93,19 +93,19 @@ reproducible from the same function.
 
 ### 2.3 Member folders — `member1_T1n/`, `member2_T1c/`, `member3_T2w/`, `member4_T2f/`, `member5_multimodal/`
 
-Each member folder has exactly **four files**, and they all follow the same
-contract:
+Each member folder has **five files** following the same contract.
+All five members are fully implemented and their test rows are
+recorded in [results/tables/test_metrics.csv](results/tables/test_metrics.csv).
 
 | File | What it does |
 |---|---|
-| `model.py` | Defines the `nn.Module` architecture for that modality. **Currently a stub** — every member must implement their own encoder-decoder. Member 5's first conv must be `in_channels=4`. |
-| `train.py` | Training entry point. Wires up the shared dataset, optimizer, AMP scaler, train+validate loops, early stopping, MLflow logging, and checkpointing. **Member 1's `train.py` is the reference template** — members 2-5 copy that loop and only swap `MODALITY` and `build_model()`. |
-| `evaluate.py` | Test-set evaluation. Loads the best checkpoint, runs `validate_one_epoch` on the held-out test split, writes a CSV row to `results/tables/`. Stub right now. |
-| `xai_analysis.py` | 3D Grad-CAM. Restores the best checkpoint, attaches `GradCAM3D` to the chosen layer (typically just before the final 1×1×1 classifier conv), produces overlays via `plot_gradcam_overlay`. Stub right now. |
-
-The fact that every member folder has the same four-file shape is the
-point — when a teammate opens your folder they should know exactly where to
-look. Do not invent extra files unless you absolutely have to.
+| `model.py` | The `nn.Module` for that modality. M1 = ResUNet+deep supervision; M2 = Attention-Gated UNet; M3 = Swin-UNETR (MONAI); M4 = ResUNet + SegResNet; M5 = 4-channel ResUNet. Every model exposes `forward_features` returning a (B, 256, H/16, W/16, D/16) bottleneck (the binding contract from CLAUDE.md §2.6b). |
+| `train.py` | Training entry point. Wires up the shared dataset, optimiser, AMP scaler, train+validate loops, early stopping, MLflow logging, and checkpointing. **Member 1's `train.py` is the reference template** — members 2–5 followed it with their own `MODALITY` and `build_model()`. |
+| `evaluate.py` | Test-set evaluation. Loads the best checkpoint, runs `validate_one_epoch` on the held-out test split, appends one row with all 12 metric columns to `results/tables/test_metrics.csv`. |
+| `xai_analysis.py` | 3D Grad-CAM. Restores the best checkpoint, attaches `GradCAM3D` to the chosen target layer, produces per-sub-region overlays via `plot_gradcam_overlay`. Guarded — refuses to run unless `test_metrics.csv` exists. |
+| `extract_features.py` | Saves the (1, 256, 8, 8, 8) bottleneck tensors per patient to `results/features/M{N}_*/`. These were the input to Pipeline C (Latent Fusion). |
+| `ablation.py` (M5 only) | Zeros one modality channel at a time, records per-sub-region Dice drops, writes `results/tables/ablation_scores.csv` and `modality_importance_scores.json`. The JSON is the XAI signal that initialises both Pipeline C's attention bias and Pipeline D's stacker weights. |
+| `app.py` (M4 only) | Gradio demo loading the trained ResUNet/SegResNet checkpoints. Closest thing the project has to the planned `interface/` Streamlit app. |
 
 ### 2.4 [data/](data/) — datasets and splits
 
@@ -133,8 +133,10 @@ look. Do not invent extra files unless you absolutely have to.
 | Path | Status |
 |---|---|
 | `experiments/mlruns/` | MLflow tracking artefacts. Each member runs MLflow locally; the directory is gitignored. |
-| `ensemble/` | Phase 4. Late-fusion / averaging across the five members. Empty placeholder for now. |
-| `interface/` | Phase 4. Streamlit demo. Empty placeholder for now. |
+| `ensemble/` | **Pipeline C — Latent Space Fusion Head, built.** `fusion.py`, `train_fusion.py`, `evaluate_fusion.py`, `features_dataset.py`, `cache_labels.py`. Underperformed naive M5 on every sub-region (see [results/tables/test_metrics.csv](results/tables/test_metrics.csv)); root cause analysis in `.claude/STATUS.md` and `.claude/design.md` §9.5. **Warning:** `cache_labels.py` has a label coordinate-frame bug — see CLAUDE.md §2.13. |
+| `LateEnsemble/` | **Pipeline D — XAI-weighted late fusion stacker, in progress.** `cache_predictions.py`, `train_stacker.py`, `evaluate_stacker.py`, `stacker.py`, `members.py`. Combines M1–M5's full-volume logit predictions via 15 trainable softmax weights initialised from the XAI ablation. Uses BraTSDataset-aligned labels (no coordinate-frame bug). |
+| `interface/` | Phase 4 Streamlit demo. Still empty. Member 4 ships a working Gradio demo at `member4_T2f/app.py` that covers most of the same surface area. |
+| `kaggle_upload/` | Mirrored subset of `shared/` and `member4_T2f/` for running on Kaggle. Not an active code path on the workstation. |
 
 ---
 
