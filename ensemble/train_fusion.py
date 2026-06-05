@@ -56,7 +56,11 @@ from ensemble.fusion import ALL_MODALITIES, LatentFusionEnsemble, build_gate_bia
 # modality count so 3-modality and 4-modality runs do not overwrite each other.
 BASE_MEMBER_NAME = "M5_LatentFusion_XAI"
 # Fusion-specific hyperparameters (override config defaults).
-FUSION_NUM_EPOCHS = 60     # bumped from 30 — small head with cold-start decoder needs more time
+# NUM_EPOCHS matches the 50 used by M1-M5 unimodal training (shared.config.NUM_EPOCHS)
+# so the methods section can say "all models trained for 50 epochs". Early stopping
+# (patience=15) will halt sooner if the val curve plateaus; the budget is just a
+# ceiling. Cosine LR decay runs over (50 - warmup) = 45 epochs.
+FUSION_NUM_EPOCHS = 50
 FUSION_BATCH_SIZE = 4
 FUSION_LR = 3e-4
 FUSION_WARMUP_EPOCHS = 5   # linear LR warmup 0 -> FUSION_LR over first 5 epochs
