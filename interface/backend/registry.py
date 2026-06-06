@@ -2,26 +2,31 @@
 
 Why a registry instead of importing models on app startup
 ----------------------------------------------------------
-Five 3D U-Nets resident on a single GPU at once OOMs anything under 16 GB.
+Several 3D U-Nets resident on a single GPU at once OOMs anything under 16 GB.
 We declare every model as data here, then materialise weights only when an
 inference call actually needs them. An LRU cap evicts the least-recently-used
 weights when the cache fills.
 
-How the 6th-slot late-fusion model plugs in
--------------------------------------------
-The user is training a separate late-fusion model on another machine. When
-they have it, they drop:
+Catalogue (as of 2026-06)
+-------------------------
+- m1_t1n, m2_t1c, m3_t2w, m4_t2f       — the four unimodal specialists.
+- m5_baseline                          — naive 4-channel multimodal U-Net.
+- pipeline_c_xai_4mod                  — XAI-initialised Latent Space Fusion
+                                         over M1–M4 bottlenecks.
+- pipeline_c_xai_3mod                  — Pipeline C controlled ablation
+                                         (drops T2w/M3).
+- pipeline_d_late_ensemble             — XAI-weighted late ensemble (the
+                                         LateEnsemble PerSubregionStacker).
 
-  1. ``ensemble/late_fusion.py`` with a callable ``build_model() -> nn.Module``
-  2. ``results/checkpoints/M6_LateFusion_best.pt``
-
-The registry detects both and auto-enables the entry. Until then the entry
-stays in the catalog as ``enabled=False`` so the frontend can show it with a
-"coming soon" badge without any code change.
+The three ensemble entries are *self-loading*: their builders compose
+multiple submodels and load every required state_dict in __init__. The
+registry skips its standard state_dict path for those, marked by
+``ModelEntry.is_self_loading=True``. Each ensemble also declares
+``extra_required_checkpoints`` so the UI can show a precise reason when an
+ensemble is disabled (e.g. "missing M3_T2w_SwinUNETR_best.pt").
 """
 from __future__ import annotations
 
-import importlib
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -45,10 +50,28 @@ class ModelEntry:
     modality: str               # "t1n" | "t1c" | "t2w" | "t2f" | "multimodal"
     in_channels: int            # 1 for unimodal, 4 for multimodal
     architecture: str           # human-readable architecture name
-    checkpoint_name: str        # filename stem under CHECKPOINTS
+    checkpoint_name: str        # filename stem under CHECKPOINTS used for the
+                                # enabled/disabled probe. For ensembles whose
+                                # weights are spread across multiple files this
+                                # is the *gating* checkpoint — typically the
+                                # fusion head or stacker.
     builder: Callable[[], nn.Module]
     description: str            # short blurb shown on the model card
     badge: str = ""             # optional UI badge ("Ensemble", "Baseline", "Coming soon")
+
+    # When True, the registry calls ``builder()`` and trusts it to have already
+    # loaded every required state_dict (this is how the ensemble wrappers
+    # work — they materialise 4-5 unimodal checkpoints + the fusion head in
+    # their own __init__). When False (the default for unimodal entries),
+    # the registry loads the matching checkpoint into the model itself.
+    is_self_loading: bool = False
+
+    # Optional list of extra checkpoint stems that must exist on disk for this
+    # entry to be considered enabled. For ensembles, these are the submodel
+    # checkpoints the wrapper will try to load at build time. Spotting a
+    # missing submodel here means the UI can flag the entry without paying
+    # the import-and-fail cost when the user clicks it.
+    extra_required_checkpoints: tuple[str, ...] = ()
 
     # populated by ModelRegistry
     enabled: bool = field(init=False, default=False)
@@ -57,6 +80,17 @@ class ModelEntry:
     @property
     def checkpoint_path(self) -> Path:
         return CHECKPOINTS / f"{self.checkpoint_name}.pt"
+
+    def missing_checkpoints(self) -> list[Path]:
+        """Return every required checkpoint that doesn't exist on disk."""
+        missing: list[Path] = []
+        if not self.checkpoint_path.exists():
+            missing.append(self.checkpoint_path)
+        for stem in self.extra_required_checkpoints:
+            p = CHECKPOINTS / f"{stem}.pt"
+            if not p.exists():
+                missing.append(p)
+        return missing
 
 
 # ---------------------------------------------------------------------------
@@ -97,20 +131,19 @@ def _build_m5() -> nn.Module:
     return MultimodalUNet3D(in_channels=4, out_channels=3)
 
 
-def _build_m6_late_fusion() -> nn.Module:
-    """Late-fusion model — user supplies the architecture later.
+def _build_pipeline_c_4mod() -> nn.Module:
+    from interface.backend.ensemble_wrappers import build_pipeline_c_4mod
+    return build_pipeline_c_4mod()
 
-    Expected: ``ensemble/late_fusion.py`` with a ``build_model() -> nn.Module``
-    callable. Until that file is added this raises ``ImportError`` and the
-    registry marks the entry disabled.
-    """
-    mod = importlib.import_module("ensemble.late_fusion")
-    if not hasattr(mod, "build_model"):
-        raise AttributeError(
-            "ensemble/late_fusion.py is present but does not expose a "
-            "build_model() function. Add `def build_model() -> nn.Module: ...`."
-        )
-    return mod.build_model()
+
+def _build_pipeline_c_3mod() -> nn.Module:
+    from interface.backend.ensemble_wrappers import build_pipeline_c_3mod
+    return build_pipeline_c_3mod()
+
+
+def _build_pipeline_d() -> nn.Module:
+    from interface.backend.ensemble_wrappers import build_pipeline_d
+    return build_pipeline_d()
 
 
 # ---------------------------------------------------------------------------
@@ -182,18 +215,76 @@ _CATALOG: tuple[ModelEntry, ...] = (
                     "any principled fusion model has to beat.",
         badge="Baseline",
     ),
+    # ------------------------------------------------------------------
+    # Pipeline C — XAI-initialised Latent-Space Fusion (the headline ensemble)
+    # ------------------------------------------------------------------
     ModelEntry(
-        key="m6_late_fusion",
-        display_name="Late Feature Fusion",
-        short_name="M6 Late Fusion",
+        key="pipeline_c_xai_4mod",
+        display_name="Pipeline C — Latent Fusion (4-mod, XAI-init)",
+        short_name="PC-4mod",
         modality="multimodal",
         in_channels=4,
-        architecture="Late feature fusion (pending)",
-        checkpoint_name="M6_LateFusion_best",
-        builder=_build_m6_late_fusion,
-        description="Late-fusion ensemble trained separately. Plug in by dropping "
-                    "ensemble/late_fusion.py + M6_LateFusion_best.pt.",
-        badge="Coming soon",
+        architecture="LatentFusionEnsemble (LayerNorm + deep decoder) over M1–M4 bottlenecks",
+        checkpoint_name="M5_LatentFusion_XAI_best",
+        builder=_build_pipeline_c_4mod,
+        description="The novel contribution. XAI ablation scores initialise the "
+                    "per-voxel modality attention bias; the LayerNorm-equalised "
+                    "M1–M4 bottlenecks are fused and decoded back to 128³.",
+        badge="Ensemble",
+        is_self_loading=True,
+        extra_required_checkpoints=(
+            "M1_T1n_ResUNet_best",
+            "M2_T1c_AttUNet_best",
+            "M3_T2w_SwinUNETR_best",
+            "M4_T2f_resunet_best",
+        ),
+    ),
+    ModelEntry(
+        key="pipeline_c_xai_3mod",
+        display_name="Pipeline C — Latent Fusion (3-mod, drop T2w)",
+        short_name="PC-3mod",
+        modality="multimodal",
+        in_channels=4,
+        architecture="LatentFusionEnsemble over M1, M2, M4 (M3/T2w excluded)",
+        checkpoint_name="M5_LatentFusion_XAI_only_t1ct1nt2f_best",
+        builder=_build_pipeline_c_3mod,
+        description="Controlled ablation against the 4-modality fusion. Drops "
+                    "the Swin/T2w branch — the modality the ablation study "
+                    "ranked least important and whose bottleneck distribution "
+                    "is least compatible with the residual-net features.",
+        badge="Ensemble (ablation)",
+        is_self_loading=True,
+        extra_required_checkpoints=(
+            "M1_T1n_ResUNet_best",
+            "M2_T1c_AttUNet_best",
+            "M4_T2f_resunet_best",
+        ),
+    ),
+    # ------------------------------------------------------------------
+    # Pipeline D — XAI-weighted late ensemble (LateEnsemble stacker)
+    # ------------------------------------------------------------------
+    ModelEntry(
+        key="pipeline_d_late_ensemble",
+        display_name="Pipeline D — XAI-Weighted Late Ensemble",
+        short_name="PD-Stacker",
+        modality="multimodal",
+        in_channels=4,
+        architecture="PerSubregionStacker (15 trainable weights, softmax over M1–M5)",
+        checkpoint_name="LateEnsemble_stacker_best",
+        builder=_build_pipeline_d,
+        description="XAI ablation scores initialise per-sub-region softmax "
+                    "weights over M1–M5's full-resolution logit predictions; "
+                    "weights are fit on the validation split. Best safety net "
+                    "if Pipeline C trails the naive baseline.",
+        badge="Ensemble",
+        is_self_loading=True,
+        extra_required_checkpoints=(
+            "M1_T1n_ResUNet_best",
+            "M2_T1c_AttUNet_best",
+            "M3_T2w_SwinUNETR_best",
+            "M4_T2f_resunet_best",
+            "M5_Multimodal_4ch_best",
+        ),
     ),
 )
 
@@ -266,9 +357,11 @@ class ModelRegistry:
 
     def _refresh_enabled_flags(self) -> None:
         for entry in self._entries.values():
-            if not entry.checkpoint_path.exists():
+            missing = entry.missing_checkpoints()
+            if missing:
                 entry.enabled = False
-                entry.load_error = f"checkpoint missing: {entry.checkpoint_path.name}"
+                names = ", ".join(p.name for p in missing)
+                entry.load_error = f"missing checkpoint(s): {names}"
                 continue
             entry.enabled = True
             entry.load_error = None
@@ -287,17 +380,26 @@ class ModelRegistry:
             return cached
 
         model = entry.builder()
-        payload = torch.load(entry.checkpoint_path, map_location="cpu")
-        state = payload.get("model_state", payload)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            # Strict=False is intentional (some checkpoints have extra heads),
-            # but we surface the diff so a real architecture mismatch shows up
-            # in logs rather than silently corrupting predictions.
-            print(
-                f"[registry] {key}: load_state_dict diff — "
-                f"missing={len(missing)}, unexpected={len(unexpected)}"
-            )
+
+        if not entry.is_self_loading:
+            # Standard unimodal/baseline path: the builder returns a blank model
+            # and we splice the matching checkpoint into it here.
+            payload = torch.load(entry.checkpoint_path, map_location="cpu")
+            state = payload.get("model_state", payload)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if missing or unexpected:
+                # Strict=False is intentional (some checkpoints have extra heads),
+                # but we surface the diff so a real architecture mismatch shows up
+                # in logs rather than silently corrupting predictions.
+                print(
+                    f"[registry] {key}: load_state_dict diff — "
+                    f"missing={len(missing)}, unexpected={len(unexpected)}"
+                )
+        else:
+            # Ensemble path: the builder (see interface/backend/ensemble_wrappers.py)
+            # has already loaded every submodel + the fusion head from disk.
+            # The registry's job here is just to move it to DEVICE and cache.
+            print(f"[registry] {key}: self-loading ensemble materialised")
 
         model.to(DEVICE)
         model.eval()
