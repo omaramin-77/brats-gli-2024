@@ -131,6 +131,31 @@ def _build_m5() -> nn.Module:
     return MultimodalUNet3D(in_channels=4, out_channels=3)
 
 
+def _build_m6_xai_guided() -> nn.Module:
+    """XAI-guided multi-task M5. Builder must reproduce the architecture the
+    checkpoint was trained against — including the (3, 4) gate init shape —
+    so we always use the XAI-init variant here. The trained gate values
+    are loaded from the checkpoint via the standard load_state_dict path.
+    """
+    from shared.config import TABLES_DIR
+    from member6_xai_guided.model import (
+        XAIGuidedMultimodalUNet3D, build_xai_gate_init,
+    )
+    importance_path = TABLES_DIR / "modality_importance_scores.json"
+    gate_init = build_xai_gate_init(importance_path) if importance_path.exists() else None
+    return XAIGuidedMultimodalUNet3D(
+        in_channels=4, out_channels=3, gate_init_logits=gate_init,
+    )
+
+
+def _build_m6_xai_guided_random() -> nn.Module:
+    """The 'random init' ablation control variant of M6."""
+    from member6_xai_guided.model import XAIGuidedMultimodalUNet3D
+    return XAIGuidedMultimodalUNet3D(
+        in_channels=4, out_channels=3, gate_init_logits=None,
+    )
+
+
 def _build_pipeline_c_4mod() -> nn.Module:
     from interface.backend.ensemble_wrappers import build_pipeline_c_4mod
     return build_pipeline_c_4mod()
@@ -214,6 +239,41 @@ _CATALOG: tuple[ModelEntry, ...] = (
         description="Stack all four modalities at the input. The numerical floor "
                     "any principled fusion model has to beat.",
         badge="Baseline",
+    ),
+    # ------------------------------------------------------------------
+    # M6 — XAI-guided multi-task M5 (Proposal C)
+    # ------------------------------------------------------------------
+    ModelEntry(
+        key="m6_xai_guided",
+        display_name="XAI-Guided Multi-Task M5",
+        short_name="M6 XAI-M5",
+        modality="multimodal",
+        in_channels=4,
+        architecture="ResUNet + 3 sub-region-specialised heads with XAI-init modality gates",
+        checkpoint_name="M6_XAIGuided_Multimodal_best",
+        builder=_build_m6_xai_guided,
+        description="M5's backbone with three sub-region-specialised heads. "
+                    "Each head holds a (4,)-vector of per-modality gate weights "
+                    "initialised from the XAI ablation scores — so at training "
+                    "step 0 the WT head emphasises T2-FLAIR and the TC/ET heads "
+                    "emphasise T1c. Gates are fully trainable; the prior is a "
+                    "starting point, not a clamp.",
+        badge="XAI-guided",
+    ),
+    ModelEntry(
+        key="m6_xai_guided_random",
+        display_name="XAI-Guided Multi-Task M5 (random init, ablation)",
+        short_name="M6 random",
+        modality="multimodal",
+        in_channels=4,
+        architecture="ResUNet + 3 sub-region-specialised heads with uniform gate init",
+        checkpoint_name="M6_XAIGuided_Multimodal_random_init_best",
+        builder=_build_m6_xai_guided_random,
+        description="Same architecture as M6 but with uniform (random) gate "
+                    "initialisation. Ablation control that isolates the value "
+                    "of the XAI prior — if this matches M6 by the end of "
+                    "training, the prior didn't earn its keep.",
+        badge="Ablation control",
     ),
     # ------------------------------------------------------------------
     # Pipeline C — XAI-initialised Latent-Space Fusion (the headline ensemble)
